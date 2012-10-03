@@ -243,7 +243,7 @@ public:
     void OnButtonTestSound( wxCommandEvent& event );
     void OnShowGpsWindowCheckboxClick( wxCommandEvent& event );
     void OnZTCCheckboxClick( wxCommandEvent& event );
-    void OnCollapsibleClick( wxCollapsiblePaneEvent& event );
+    void OnRadarringSelect( wxCommandEvent& event );
     void OnShipTypeSelect( wxCommandEvent& event );
     void OnButtonGroups( wxCommandEvent& event );
     void OnInsertTideDataLocation( wxCommandEvent &event );
@@ -454,9 +454,8 @@ public:
     PluginListPanel         *m_pPlugInCtrl;
     int                     k_plugins;
 
-//    For "Etc." Page
-    wxCollapsiblePane       *pNavAidShowRadarRings;
-    wxTextCtrl              *pNavAidRadarRingsNumberVisible;
+    wxChoice                *pNavAidRadarRingsNumberVisible;
+    wxFlexGridSizer         *radarGrid;
     wxTextCtrl              *pNavAidRadarRingsStep;
     wxChoice                *m_itemRadarRingsUnits;
     wxCheckBox              *pWayPointPreventDragging;
