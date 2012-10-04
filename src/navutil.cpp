@@ -3204,6 +3204,7 @@ int MyConfig::LoadMyConfig( int iteration )
     wxString connectionconfigs;
     Read ( _T( "DataConnections" ),  &connectionconfigs, wxEmptyString );
     wxArrayString confs = wxStringTokenize(connectionconfigs, _T("|"));
+    g_pConnectionParams->Clear();
     for (size_t i = 0; i < confs.Count(); i++)
     {
         ConnectionParams * prm = new ConnectionParams(confs[i]);

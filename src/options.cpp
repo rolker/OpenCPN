@@ -627,6 +627,7 @@ void options::CreatePanel_NMEA( size_t parent, int border_size, int group_item_s
     fgSizer5->Add( m_cbGarminHost, 0, wxALL, 5 );
 
     sbSizerConnectionProps->Add( gSizerSerProps, 0, wxEXPAND, 5 );
+    sbSizerConnectionProps->Add( fgSizer5, 0, wxEXPAND, 5 );
 
     sbSizerInFilter = new wxStaticBoxSizer( new wxStaticBox( m_pNMEAForm, wxID_ANY, _("Input filtering") ), wxVERTICAL );
 
@@ -1734,11 +1735,11 @@ void options::SetInitialSettings()
 
     if( g_bGarminHost ) pGarminHost->SetValue( true );
 */
-/*TODO    pFilterNMEA->SetValue( g_bfilter_cogsog );
+    m_cbFilterSogCog->SetValue( g_bfilter_cogsog );
 
     s.Printf( _T("%d"), g_COGFilterSec );
-    pFilterSecs->SetValue( s );
-
+    m_tFilterSec->SetValue( s );
+/*TODO
     s.Printf( _T("%d"), g_COGAvgSec );
     pCOGUPUpdateSecs->SetValue( s );
 */
@@ -2294,16 +2295,16 @@ void options::OnApplyClick( wxCommandEvent& event )
     bool temp_bopengl = pOpenGL->GetValue();
     g_bsmoothpanzoom = pSmoothPanZoom->GetValue();
 
-//TODO    g_bfilter_cogsog = pFilterNMEA->GetValue();
+    g_bfilter_cogsog = m_cbFilterSogCog->GetValue();
 
     long filter_val = 1;
-/*TODO    pFilterSecs->GetValue().ToLong( &filter_val );
+    m_tFilterSec->GetValue().ToLong( &filter_val );
     g_COGFilterSec = wxMin((int)filter_val, MAX_COGSOG_FILTER_SECONDS);
     g_COGFilterSec = wxMax(g_COGFilterSec, 1);
     g_SOGFilterSec = g_COGFilterSec;
 
     long update_val = 1;
-    pCOGUPUpdateSecs->GetValue().ToLong( &update_val );
+/*TODO    pCOGUPUpdateSecs->GetValue().ToLong( &update_val );
     g_COGAvgSec = wxMin((int)update_val, MAX_COG_AVERAGE_SECONDS);
 */
     g_bCourseUp = pCBCourseUp->GetValue();
