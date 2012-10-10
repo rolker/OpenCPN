@@ -685,6 +685,7 @@ public:
     bool RenderQuiltRegionViewOnDC( wxMemoryDC &dc, ViewPort &vp, wxRegion &chart_region );
     bool IsVPBlittable( ViewPort &VPoint, int dx, int dy, bool b_allow_vector = false );
     ChartBase *GetChartAtPix( wxPoint p );
+    ChartBase *GetOverlayChartAtPix( wxPoint p );
     int GetChartdbIndexAtPix( wxPoint p );
     void InvalidateAllQuiltPatchs( void );
     void Invalidate( void )
@@ -1177,14 +1178,38 @@ ChartBase *Quilt::GetChartAtPix( wxPoint p )
     ChartBase *pret = NULL;
     wxPatchListNode *cnode = m_PatchList.GetFirst();
     while( cnode ) {
-        if( cnode->GetData()->ActiveRegion.Contains( p ) == wxInRegion ) pret =
-                ChartData->OpenChartFromDB( cnode->GetData()->dbIndex, FULL_INIT );
+        QuiltPatch *pqp = cnode->GetData();
+        if( !pqp->b_overlay && (pqp->ActiveRegion.Contains( p ) == wxInRegion) )
+                pret = ChartData->OpenChartFromDB( pqp->dbIndex, FULL_INIT );
         cnode = cnode->GetNext();
     }
 
     m_bbusy = false;
     return pret;
 }
+
+ChartBase *Quilt::GetOverlayChartAtPix( wxPoint p )
+{
+    if( m_bbusy ) return NULL;
+    
+    m_bbusy = true;
+    
+    //    The patchlist is organized from small to large scale.
+    //    We generally will want the largest scale chart at this point, so
+    //    walk the whole list.  The result will be the last one found, i.e. the largest scale chart.
+    ChartBase *pret = NULL;
+    wxPatchListNode *cnode = m_PatchList.GetFirst();
+    while( cnode ) {
+        QuiltPatch *pqp = cnode->GetData();
+        if( pqp->b_overlay && ( pqp->ActiveRegion.Contains( p ) == wxInRegion) )
+                pret = ChartData->OpenChartFromDB( pqp->dbIndex, FULL_INIT );
+        cnode = cnode->GetNext();
+    }
+    
+    m_bbusy = false;
+    return pret;
+}
+
 
 void Quilt::InvalidateAllQuiltPatchs( void )
 {
@@ -2257,7 +2282,8 @@ bool Quilt::Compose( const ViewPort &vp_in )
             if( pc->GetChartType() == CHART_TYPE_S57 ) {
                 s57chart *ps57 = dynamic_cast<s57chart *>( pc );
                 pqp->b_overlay = ( ps57->GetUsageChar() == 'L' || ps57->GetUsageChar() == 'A' );
-                m_bquilt_has_overlays = true;
+                if( pqp->b_overlay ) 
+                    m_bquilt_has_overlays = true;
             }
         }
     }
@@ -2357,22 +2383,21 @@ bool Quilt::RenderQuiltRegionViewOnDC( wxMemoryDC &dc, ViewPort &vp, wxRegion &c
         ChartBase *chart = GetFirstChart();
         int chartsDrawn = 0;
 
-        while( chart ) {
-            bool okToRender = cc1->IsChartLargeEnoughToRender( chart, vp );
+        if( !chart_region.IsEmpty() ) {
+            while( chart ) {
+                bool okToRender = cc1->IsChartLargeEnoughToRender( chart, vp );
 
-            if( chart->GetChartProjectionType() != PROJECTION_MERCATOR && vp.b_MercatorProjectionOverride )
-                okToRender = false;
+                if( chart->GetChartProjectionType() != PROJECTION_MERCATOR && vp.b_MercatorProjectionOverride )
+                    okToRender = false;
 
-            if( ! okToRender ) {
-                chart = GetNextChart();
-                continue;
-            }
-            QuiltPatch *pqp = GetCurrentPatch();
-            if( pqp->b_Valid  ) {
-                bool b_chart_rendered = false;
-                wxRegion get_region = pqp->ActiveRegion;
-
-                if( !chart_region.IsEmpty() ) {
+                if( ! okToRender ) {
+                    chart = GetNextChart();
+                    continue;
+                }
+                QuiltPatch *pqp = GetCurrentPatch();
+                if( pqp->b_Valid  ) {
+                    bool b_chart_rendered = false;
+                    wxRegion get_region = pqp->ActiveRegion;
 
                     get_region.Intersect( chart_region );
 
@@ -2390,50 +2415,47 @@ bool Quilt::RenderQuiltRegionViewOnDC( wxMemoryDC &dc, ViewPort &vp, wxRegion &c
                     while( upd ) {
                         wxRect rect = upd.GetRect();
                         dc.Blit( rect.x, rect.y, rect.width, rect.height, &tmp_dc, rect.x, rect.y,
-                                 wxCOPY, true );
+                                wxCOPY, true );
                         upd++;
                     }
 
                     tmp_dc.SelectObject( wxNullBitmap );
+
+                    if(b_chart_rendered)
+                        rendered_region.Union(get_region);
                 }
 
-                if(b_chart_rendered)
-                    rendered_region.Union(get_region);
+                chartsDrawn++;
+                chart = GetNextChart();
             }
-
-            chartsDrawn++;
-            chart = GetNextChart();
         }
 
         if( ! chartsDrawn ) cc1->GetVP().SetProjectionType( PROJECTION_MERCATOR );
 
         //    Render any Overlay patches for s57 charts(cells)
-        if( m_bquilt_has_overlays ) {
+        if( m_bquilt_has_overlays && !chart_region.IsEmpty() ) {
             chart = GetFirstChart();
             while( chart ) {
                 QuiltPatch *pqp = GetCurrentPatch();
                 if( pqp->b_Valid ) {
-                    if( !chart_region.IsEmpty() ) {
+                    if( pqp->b_overlay ) {
                         wxRegion get_region = pqp->ActiveRegion;
                         get_region.Intersect( chart_region );
 
                         if( !get_region.IsEmpty() ) {
-                            if( pqp->b_overlay ) {
-                                s57chart *Chs57 = dynamic_cast<s57chart*>( chart );
-                                Chs57->RenderOverlayRegionViewOnDC( tmp_dc, vp, get_region );
+                            s57chart *Chs57 = dynamic_cast<s57chart*>( chart );
+                            Chs57->RenderOverlayRegionViewOnDC( tmp_dc, vp, get_region );
+                                
+                            wxRegionIterator upd( get_region );
+                            while( upd ) {
+                                wxRect rect = upd.GetRect();
+                                dc.Blit( rect.x, rect.y, rect.width, rect.height, &tmp_dc, rect.x,
+                                      rect.y, wxCOPY, true );
+                                upd++;
                             }
+                            tmp_dc.SelectObject( wxNullBitmap );
                         }
-
-                        wxRegionIterator upd( get_region );
-                        while( upd ) {
-                            wxRect rect = upd.GetRect();
-                            dc.Blit( rect.x, rect.y, rect.width, rect.height, &tmp_dc, rect.x,
-                                     rect.y, wxCOPY, true );
-                            upd++;
-                        }
-
-                        tmp_dc.SelectObject( wxNullBitmap );
-                    }
+                     }
                 }
 
                 chart = GetNextChart();
@@ -3605,6 +3627,15 @@ ChartBase* ChartCanvas::GetChartAtCursor() {
             target_chart = cc1->m_pQuilt->GetChartAtPix( wxPoint( mouse_x, mouse_y ) );
         else
             target_chart = NULL;
+    return target_chart;
+}
+
+ChartBase* ChartCanvas::GetOverlayChartAtCursor() {
+    ChartBase* target_chart;
+    if( VPoint.b_quilt )
+        target_chart = cc1->m_pQuilt->GetOverlayChartAtPix( wxPoint( mouse_x, mouse_y ) );
+    else
+        target_chart = NULL;
     return target_chart;
 }
 
@@ -8384,6 +8415,16 @@ void ChartCanvas::ShowObjectQueryWindow( int x, int y, float zlat, float zlon )
         if( !lightsVis ) gFrame->ToggleLights( true, true );
         ListOfObjRazRules* rule_list =
                 Chs57->GetObjRuleListAtLatLon( zlat, zlon, SelectRadius, &GetVP() );
+                
+        ListOfObjRazRules* overlay_rule_list = NULL;
+        ChartBase *overlay_chart = GetOverlayChartAtCursor();
+        s57chart *CHs57_Overlay = dynamic_cast<s57chart*>( overlay_chart );
+        
+        if( CHs57_Overlay ) {
+            overlay_rule_list =
+                CHs57_Overlay->GetObjRuleListAtLatLon( zlat, zlon, SelectRadius, &GetVP() );
+        }
+        
         if( !lightsVis ) gFrame->ToggleLights( true, true );
 
         wxString objText;
@@ -8406,7 +8447,13 @@ void ChartCanvas::ShowObjectQueryWindow( int x, int y, float zlat, float zlon )
         objText += face;
         objText += _T("\">");
 
+        if( overlay_rule_list && CHs57_Overlay) {
+            objText << CHs57_Overlay->CreateObjDescriptions( overlay_rule_list );
+            objText << _T("<hr noshade>");
+        }
+        
         objText << Chs57->CreateObjDescriptions( rule_list );
+       
         objText << _T("</font></body></html>");
 
         g_pObjectQueryDialog->SetHTMLPage( objText );
@@ -8416,6 +8463,10 @@ void ChartCanvas::ShowObjectQueryWindow( int x, int y, float zlat, float zlon )
         rule_list->Clear();
         delete rule_list;
 
+        if( overlay_rule_list )
+            overlay_rule_list->Clear();
+        delete overlay_rule_list;
+        
         SetCursor( wxCURSOR_ARROW );
     }
 }
