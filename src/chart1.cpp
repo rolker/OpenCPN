@@ -4818,7 +4818,6 @@ void MyFrame::OnFrameTimer1( wxTimerEvent& event )
             m_bdefer_resize = false;
         }
     }
-
 }
 
 void MyFrame::TouchAISActive( void )
