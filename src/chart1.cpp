@@ -491,8 +491,7 @@ wxString                  g_default_wp_icon;
 Track                     *g_pActiveTrack;
 double                    g_TrackIntervalSeconds;
 double                    g_TrackDeltaDistance;
-bool                      g_bTrackTime;
-bool                      g_bTrackDistance;
+int                       g_nTrackPrecision;
 
 int                       g_total_NMEAerror_messages;
 
@@ -3319,7 +3318,7 @@ void MyFrame::OnToolLeftClick( wxCommandEvent& event )
         case ID_TRACK: {
             if( !g_bTrackActive ) TrackOn();
             else
-                TrackOff();
+                TrackOff( true );
             break;
         }
 
@@ -3440,11 +3439,6 @@ void MyFrame::TrackOn( void )
 {
     g_bTrackActive = true;
     g_pActiveTrack = new Track();
-
-    g_pActiveTrack->SetTrackTimer( g_TrackIntervalSeconds );
-    g_pActiveTrack->SetTrackDeltaDistance( g_TrackDeltaDistance );
-    g_pActiveTrack->SetTPTime( g_bTrackTime );
-    g_pActiveTrack->SetTPDist( g_bTrackDistance );
 
     pRouteList->Append( g_pActiveTrack );
     g_pActiveTrack->Start();
@@ -3881,10 +3875,7 @@ int MyFrame::ProcessOptionsDialog( int rr, options* dialog )
     pConfig->UpdateSettings();
 
     if( g_pActiveTrack ) {
-        g_pActiveTrack->SetTrackTimer( g_TrackIntervalSeconds );
-        g_pActiveTrack->SetTrackDeltaDistance( g_TrackDeltaDistance );
-        g_pActiveTrack->SetTPTime( g_bTrackTime );
-        g_pActiveTrack->SetTPDist( g_bTrackDistance );
+        g_pActiveTrack->SetPrecision( g_nTrackPrecision );
     }
 
     if( ( bPrevQuilt != g_bQuiltEnable ) || ( bPrevFullScreenQuilt != g_bFullScreenQuilt ) ) {
