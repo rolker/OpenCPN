@@ -1963,10 +1963,6 @@ int MyApp::OnExit()
     if( ptcmgr ) delete ptcmgr;
 
     wxLogMessage( _T("opencpn::MyApp exiting cleanly...\n") );
-
-    g_pConnectionParams->Clear();
-    delete g_pConnectionParams;
-
     delete pConfig;
     delete pSelect;
     delete pSelectTC;
@@ -2134,10 +2130,10 @@ MyFrame::MyFrame( wxFrame *frame, const wxString& title, const wxPoint& pos, con
         else
             port_type = DS_TYPE_INPUT_OUTPUT;
         DataStream *dstr = new DataStream( g_pMUX, cp->GetDSPort(), wxString::Format(wxT("%i"), cp->Baudrate), port_type );
-        dstr->SetInputFilterType(cp->InputSentenceListType);
         dstr->SetInputFilter(cp->InputSentenceList);
-        dstr->SetOutputFilterType(cp->OutputSentenceListType);
+        dstr->SetInputFilterType(cp->InputSentenceListType);
         dstr->SetOutputFilter(cp->OutputSentenceList);
+        dstr->SetOutputFilterType(cp->OutputSentenceListType);
         g_pMUX->AddStream(dstr);
     }
     g_pMUX->SetAISHandler(g_pAIS);
