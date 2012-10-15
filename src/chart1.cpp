@@ -2193,6 +2193,8 @@ MyFrame::~MyFrame()
     }
     delete pRouteList;
     delete g_FloatingToolbarConfigMenu;
+    g_pMUX->ClearStreams();
+    delete g_pMUX;
 }
 
 void MyFrame::OnEraseBackground( wxEraseEvent& event )
