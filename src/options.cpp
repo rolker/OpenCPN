@@ -262,6 +262,7 @@ options::~options()
     m_rbOIgnore->Disconnect( wxEVT_COMMAND_RADIOBUTTON_SELECTED, wxCommandEventHandler( options::OnRbOutput ), NULL, this );
     m_tcOutputStc->Disconnect( wxEVT_COMMAND_TEXT_UPDATED, wxCommandEventHandler( options::OnValChange ), NULL, this );
     m_btnOutputStcList->Disconnect( wxEVT_COMMAND_BUTTON_CLICKED, wxCommandEventHandler( options::OnBtnOStcs ), NULL, this );
+    m_cbNMEADebug->Disconnect( wxEVT_COMMAND_CHECKBOX_CLICKED, wxCommandEventHandler( options::OnShowGpsWindowCheckboxClick ), NULL, this );
 
     delete m_pSerialArray;
     groupsPanel->EmptyChartGroupArray( m_pGroupArray );
@@ -728,6 +729,7 @@ void options::CreatePanel_NMEA( size_t parent, int border_size, int group_item_s
     m_rbOIgnore->Connect( wxEVT_COMMAND_RADIOBUTTON_SELECTED, wxCommandEventHandler( options::OnRbOutput ), NULL, this );
     m_tcOutputStc->Connect( wxEVT_COMMAND_TEXT_UPDATED, wxCommandEventHandler( options::OnValChange ), NULL, this );
     m_btnOutputStcList->Connect( wxEVT_COMMAND_BUTTON_CLICKED, wxCommandEventHandler( options::OnBtnOStcs ), NULL, this );
+    m_cbNMEADebug->Connect( wxEVT_COMMAND_CHECKBOX_CLICKED, wxCommandEventHandler( options::OnShowGpsWindowCheckboxClick ), NULL, this );
 
     wxListItem col0;
     col0.SetId(0);
@@ -1722,8 +1724,8 @@ void options::SetInitialSettings()
 
     if( m_pConfig ) pSettingsCB1->SetValue( m_pConfig->m_bShowDebugWindows );
 
-/*TODO    if( g_NMEALogWindow ) pShowGPSWin->SetValue( true );
-
+    if( g_NMEALogWindow ) m_cbNMEADebug->SetValue( true );
+/*TODO
     if( g_bGarminHost ) pGarminHost->SetValue( true );
 */
     m_cbFilterSogCog->SetValue( g_bfilter_cogsog );
@@ -1952,11 +1954,11 @@ void options::SetInitialSettings()
 
 void options::OnShowGpsWindowCheckboxClick( wxCommandEvent& event )
 {
-/*TODO    if( !pShowGPSWin->GetValue() ) {
+    if( !m_cbNMEADebug->GetValue() ) {
         if( g_NMEALogWindow ) g_NMEALogWindow->Destroy();
     } else {
         g_NMEALogWindow = new TTYWindow( pParent, 35 );
-        wxString com_string( m_itemNMEAListBox->GetValue() );
+        wxString com_string = _("NMEA Debug Window");
         g_NMEALogWindow->SetTitle( com_string );
 
         //    Make sure the window is well on the screen
@@ -1967,7 +1969,6 @@ void options::OnShowGpsWindowCheckboxClick( wxCommandEvent& event )
                 g_NMEALogWindow_sy );
         g_NMEALogWindow->Show();
     }
-*/
 }
 
 void options::OnZTCCheckboxClick( wxCommandEvent& event )
