@@ -41,6 +41,7 @@ enum TrackContextMenu {
 
 class wxButton;
 class Route;
+class Track;
 class Layer;
 class RoutePoint;
 
@@ -48,18 +49,31 @@ class RouteManagerDialog : public wxDialog {
       DECLARE_EVENT_TABLE()
 
       public:
-            RouteManagerDialog(wxWindow *parent);
+            static RouteManagerDialog* getInstance(wxWindow *parent);
+            static bool getInstanceFlag(){ return instanceFlag; } 
             ~RouteManagerDialog();
+            
+            void OnClose(wxCloseEvent& event);
+            void OnOK(wxCommandEvent& event);
+            
             void SetColorScheme();
+            void RecalculateSize();
             void UpdateRouteListCtrl();     // Rebuild route list
             void UpdateTrkListCtrl();
             void UpdateWptListCtrl(RoutePoint *rp_select = NULL, bool b_retain_sort = false);
             void UpdateLayListCtrl();
+            void UpdateWptListCtrlViz();
+            
             void OnTabSwitch(wxNotebookEvent& event);
             static void WptShowPropertiesDialog( RoutePoint* wp, wxWindow* parent );
-
+            void TrackToRoute( Track *track );
 
       private:
+            static bool instanceFlag;
+            static RouteManagerDialog *single;
+            
+            RouteManagerDialog(wxWindow *parent);
+            
             void Create();
             void UpdateRteButtons();           // Correct button state
             void MakeAllRoutesInvisible();  // Mark all routes as invisible. Does not flush settings.
@@ -121,7 +135,8 @@ class RouteManagerDialog : public wxDialog {
             void OnLayColumnClicked(wxListEvent &event);
             void OnImportClick(wxCommandEvent &event);
             void OnExportClick(wxCommandEvent &event);
-
+            void OnExportVizClick(wxCommandEvent &event);
+            
             // properties
             wxNotebook *m_pNotebook;
             wxPanel    *m_pPanelRte;
@@ -163,7 +178,8 @@ class RouteManagerDialog : public wxDialog {
             wxButton *btnLayDelete;
             wxButton *btnImport;
             wxButton *btnExport;
-
+            wxButton *btnExportViz;
+            
             bool m_bPossibleClick;    // do
             bool m_bCtrlDown;         // record control key state for some action buttons
             bool m_bNeedConfigFlush;  // if true, update config in destructor
@@ -171,6 +187,8 @@ class RouteManagerDialog : public wxDialog {
             int m_lastWptItem;
             int m_lastTrkItem;
             int m_lastRteItem;
+            
+            int m_charWidth;
 };
 
 #endif // _RouteManagerDialog_h_

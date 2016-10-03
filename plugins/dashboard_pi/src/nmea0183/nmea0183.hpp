@@ -104,12 +104,16 @@
 #include "dpt.hpp"
 #include "mta.hpp" //Air temperature
 #include "mtw.hpp" //Water temperature
+#include "mda.hpp" //barometric pressure
 #include "mwd.hpp"
 #include "mwv.hpp"
 #include "vhw.hpp"
 #include "vwr.hpp"
 #include "vwt.hpp"
 #include "zda.hpp"
+#include "vlw.hpp"
+#include "xdr.hpp" //transducer data
+#include "xte.hpp"
 /*
 #include "ROT.hpp"
 #include "RPM.hpp"
@@ -200,6 +204,7 @@ class NMEA0183
       MTW Mtw;
       MWD Mwd;
       MWV Mwv;
+      MDA Mda; //Metrological comopsite	
 /*
       OLN Oln;
       OSD Osd;
@@ -226,8 +231,9 @@ class NMEA0183
       VDR Vdr;
 */
       VHW Vhw;
+	  VLW Vlw;
 /*
-      VLW Vlw;
+      
       VPW Vpw;
 */
       VTG Vtg;
@@ -238,9 +244,9 @@ class NMEA0183
       WNC Wnc;
 */
       WPL Wpl;
-/*
+
       XDR Xdr;
-      XTE Xte;
+/*    XTE Xte;
       XTR Xtr;
 */
       ZDA Zda;

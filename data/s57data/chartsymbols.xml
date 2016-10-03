@@ -2508,8 +2508,7 @@
 			<disp-prio>Area 2</disp-prio>
 			<radar-prio>Supressed</radar-prio>
 			<table-name>Plain</table-name>
-			<attrib-code index="0">CATVEG13</attrib-code>
-			<instruction>AP(VEGATN03);LS(DASH,1,LANDF)</instruction>
+			<instruction>AP(CROSSX02);LS(DASH,1,LANDF)</instruction>
 			<display-cat>Other</display-cat>
 			<comment>32030</comment>
 		</lookup>
@@ -5840,8 +5839,7 @@
 			<disp-prio>Area 2</disp-prio>
 			<radar-prio>Supressed</radar-prio>
 			<table-name>Symbolized</table-name>
-			<attrib-code index="0">CATVEG13</attrib-code>
-			<instruction>AP(VEGATN03);LS(DASH,1,LANDF)</instruction>
+			<instruction>AP(CROSSX02);LS(DASH,1,LANDF)</instruction>
 			<display-cat>Other</display-cat>
 			<comment>32030</comment>
 		</lookup>
@@ -30916,6 +30914,63 @@
 			<display-cat>Standard</display-cat>
 			<comment>10000</comment>
 		</lookup>
+                <lookup id="1996" RCID="54023" name="ANNOTA">
+                        <type>Point</type>
+                        <disp-prio>Area 2</disp-prio>
+                        <radar-prio>On Top</radar-prio>
+                        <table-name>Paper</table-name>
+                        <instruction>TX(ANTXT1,3,2,2,'15114',1,0,CHBLK,26)</instruction>
+                        <display-cat>Standard</display-cat>
+                        <comment>54023</comment>
+                </lookup>
+                <lookup id="1733" RCID="54024" name="RESTRC">
+                        <type>Line</type>
+                        <disp-prio>Area Symbol</disp-prio>
+                        <radar-prio>On Top</radar-prio>
+                        <table-name>Lines</table-name>
+                        <instruction>LS(DASH,1,CHMGD)</instruction>
+                        <display-cat>Standard</display-cat>
+                        <comment>24010</comment>
+                </lookup>
+                <lookup id="1733" RCID="54025" name="TRFLNE">
+                        <type>Line</type>
+                        <disp-prio>Area Symbol</disp-prio>
+                        <radar-prio>On Top</radar-prio>
+                        <table-name>Lines</table-name>
+                        <instruction>LS(DASH,2,CHMGD)</instruction>
+                        <display-cat>Standard</display-cat>
+                        <comment>24010</comment>
+                </lookup>
+                <lookup id="1733" RCID="54026" name="GENNAV">
+                        <type>Point</type>
+                        <disp-prio>Hazards</disp-prio>
+                        <radar-prio>On Top</radar-prio>
+                        <table-name>Paper</table-name>
+                        <attrib-code index="0">BCNSHP3</attrib-code>
+                        <instruction>SY(BCNTOW01);TE('%s','OBJNAM',2,1,2,'15110',-1,-2,CHBLK,21)</instruction>
+                        <display-cat>Standard</display-cat>
+                        <comment>17020</comment>
+                </lookup>
+                <lookup id="1996" RCID="54027" name="ANNOTA">
+                        <type>Point</type>
+                        <disp-prio>Area 2</disp-prio>
+                        <radar-prio>On Top</radar-prio>
+                        <table-name>Simplified</table-name>
+                        <instruction>TX(ANTXT1,3,2,2,'15114',1,0,CHBLK,26)</instruction>
+                        <display-cat>Standard</display-cat>
+                        <comment>54023</comment>
+                </lookup>
+                <lookup id="1997" RCID="54028" name="GENNAV">
+                        <type>Point</type>
+                        <disp-prio>Hazards</disp-prio>
+                        <radar-prio>On Top</radar-prio>
+                        <table-name>Simplified</table-name>
+                        <instruction>SY(BCNTOW01);TE('%s','OBJNAM',2,1,2,'15110',-1,-2,CHBLK,21)</instruction>
+                        <display-cat>Standard</display-cat>
+                        <comment>17020</comment>
+                </lookup>
+
+
 	</lookups>
 
 	<line-styles>
@@ -30952,6 +31007,17 @@
 			<HPGL>SPA;SW2;PU2105,1470;PD2409,1470;SPA;SW2;PU2261,1470;PD2261,1620;</HPGL>
 			<color-ref>ACHGRD</color-ref>
 		</line-style>
+                <line-style RCID="3192">
+                        <name>ESSARE01</name>
+                        <vector width="304" height="150">
+                                <distance min="0" max="0" />
+                                <pivot x="1904" y="1468" />
+                                <origin x="2105" y="1470" />
+                        </vector>
+                        <description>ESSA or PSSA boundary</description>
+                        <HPGL>SPA;SW2;PU2105,1470;PD2409,1470;SPA;SW2;PU2261,1470;PD2261,1620;</HPGL>
+                        <color-ref>ACHMGD</color-ref>
+                </line-style>
 		<line-style RCID="3347">
 			<name>CBLARE51</name>
 			<vector width="2739" height="500">
@@ -31968,7 +32034,7 @@
 			<filltype>L</filltype>
 			<spacing>C</spacing>
 			<description>area of depth less than the safety contour</description>
-			<bitmap width="9" height="9">
+			<bitmap width="32" height="32">
 				<distance min="0" max="0" />
 				<pivot x="5" y="5" />
 				<origin x="0" y="0" />
@@ -31976,7 +32042,37 @@
 			</bitmap>
 			<color-ref>ACHGRD</color-ref>
 		</pattern>
-	</patterns>
+
+		<pattern RCID="3">
+                        <name>CROSSX01</name>
+                        <definition>R</definition>
+                        <filltype>L</filltype>
+                        <spacing>C</spacing>
+                        <description>General Cross Hatch pattern, Angle 0</description>
+                        <bitmap width="16" height="16">
+                                <distance min="0" max="0" />
+                                <pivot x="8" y="8" />
+                                <origin x="0" y="0" />
+                                <graphics-location x="400" y="1040" />
+                        </bitmap>
+                        <color-ref>ACHBRN</color-ref>
+                </pattern>
+
+                <pattern RCID="4">
+                        <name>CROSSX02</name>
+                        <definition>R</definition>
+                        <filltype>L</filltype>
+                        <spacing>C</spacing>
+                        <description>General small dot pattern</description>
+                        <bitmap width="16" height="16">
+                                <distance min="0" max="0" />
+                                <pivot x="8" y="8" />
+                                <origin x="0" y="0" />
+                                <graphics-location x="430" y="1040" />
+                        </bitmap>
+                        <color-ref>ACHBRN</color-ref>
+                </pattern>
+        </patterns>
 
 	<symbols>
 
@@ -38431,6 +38527,7 @@
 				<HPGL>SPI;ST2;PU1500,1500;PM0;PD1375,937,1375,912,1381,875,1400,843,1418,825,1450,800,1493,800,1531,800,1556,806,1593,831;PD1606,868,1612,900,1612,931,1500,1500;PM2;FP;SPI;SW1;PU1500,1500;PD1375,925;PD1375,887;PD1387,850;PD1406,831;PD1437,806;PD1475,800;PD1500,800;PD1531,800;PD1562,812;PD1587,837;PD1606,875;PD1612,900;PD1606,956;PD1500,1500;</HPGL>
 			</vector>
 			<definition>V</definition>
+                        <prefer-bitmap>no</prefer-bitmap>
 		</symbol>
 
 		<symbol RCID="32">

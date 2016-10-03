@@ -60,13 +60,17 @@
 #include "depth.h"
 #include "clock.h"
 #include "wind_history.h"
-
+#include "baro_history.h"
+#include "from_ownship.h"
+#include "iirfilter.h"
 
 class DashboardWindow;
 class DashboardWindowContainer;
 class DashboardInstrumentContainer;
 
 #define DASHBOARD_TOOL_POSITION -1          // Request default positioning of toolbar tool
+
+#define gps_watchdog_timeout_ticks  10
 
 class DashboardWindowContainer
 {
@@ -76,8 +80,9 @@ class DashboardWindowContainer
 
             ~DashboardWindowContainer(){}
             DashboardWindow              *m_pDashboardWindow;
-            bool                          m_bIsVisible; // Only used for config
-            bool                          m_bIsDeleted; // Only used for config
+            bool                          m_bIsVisible; 
+            bool                          m_bIsDeleted; 
+            bool                          m_bPersVisible;  // Persists visibility, even when Dashboard tool is toggled off.
             wxString                      m_sName;
             wxString                      m_sCaption;
             wxString                      m_sOrientation;
@@ -146,6 +151,7 @@ public:
       void ShowDashboard( size_t id, bool visible );
       int GetToolbarItemId(){ return m_toolbar_item_id; }
       int GetDashboardWindowShownCount();
+      void SetPluginMessage(wxString &message_id, wxString &message_body);
 
 private:
       bool LoadConfig(void);
@@ -171,7 +177,13 @@ private:
       wxDateTime           mUTCDateTime;
       int                  m_config_version;
       wxString             m_VDO_accumulator;
+      int                  mHDx_Watchdog;
+      int                  mHDT_Watchdog;
+      int                  mGPS_Watchdog;
+      int                  mVar_Watchdog;
 
+      iirfilter            mSOGFilter;
+      iirfilter            mCOGFilter;
 //protected:
 //      DECLARE_EVENT_TABLE();
 };
@@ -199,6 +211,13 @@ public:
       wxFontPickerCtrl             *m_pFontPickerData;
       wxFontPickerCtrl             *m_pFontPickerLabel;
       wxFontPickerCtrl             *m_pFontPickerSmall;
+      wxSpinCtrl                   *m_pSpinSpeedMax;
+      wxSpinCtrl                   *m_pSpinCOGDamp;
+      wxSpinCtrl                   *m_pSpinSOGDamp;
+      wxChoice                     *m_pChoiceSpeedUnit;
+      wxChoice                     *m_pChoiceDepthUnit;
+      wxChoice                     *m_pChoiceDistanceUnit;
+      wxChoice                     *m_pChoiceWindSpeedUnit;
 
 private:
       void UpdateDashboardButtonsState(void);

@@ -27,11 +27,9 @@ Elément de base d'un fichier GRIB
 #include <iostream>
 #include <cmath>
 
-#include "zuFile.h"
-
 #define DEBUG_INFO    false
 #define DEBUG_ERROR   true
-#define debug(format, ...)  {if(DEBUG_INFO)  {fprintf(stderr,format,__VA_ARGS__);fprintf(stderr,"\n");}}
+#define grib_debug(format, ...)  {if(DEBUG_INFO)  {fprintf(stderr,format,__VA_ARGS__);fprintf(stderr,"\n");}}
 #define erreur(format, ...) {if(DEBUG_ERROR) {fprintf(stderr,"ERROR: ");fprintf(stderr,format,__VA_ARGS__);fprintf(stderr,"\n");}}
 
 #define zuint  unsigned int
@@ -80,7 +78,7 @@ Elément de base d'un fichier GRIB
 #define GRB_CAPE 		  157   /* J/kg   */
 
 #define GRB_TSEC          171   /* "Seconds prior to initial reference time (defined in bytes 18-20)" */
-
+#define GRB_WIND_GUST     180   /* m/s "wind gust */
 #define GRB_USCT          190   /* Scatterometer estimated U Wind, NCEP Center 7  */
 #define GRB_VSCT          191   /* Scatterometer estimated V Wind, NCEP Center 7  */
 
@@ -96,8 +94,19 @@ Elément de base d'un fichier GRIB
 #define LV_MSL       102
 #define LV_ABOV_GND  105
 #define LV_SIGMA     107
+#define LV_ATMOS_ENT  10
 #define LV_ATMOS_ALL 200
-
+//---------------------------------------------------------
+enum DataCenterModel {
+    NOAA_GFS,
+    NOAA_NCEP_WW3,
+    NOAA_NCEP_SST,
+    NOAA_RTOFS,
+    FNMOC_WW3_GLB,
+    FNMOC_WW3_MED,
+    NORWAY_METNO,
+    OTHER_DATA_CENTER
+};
 
 //----------------------------------------------
 class GribCode
@@ -121,23 +130,33 @@ class GribCode
 class GribRecord
 {
     public:
-        GribRecord(ZUFILE* file, int id_);
         GribRecord(const GribRecord &rec);
-        ~GribRecord();
+        GribRecord() { m_bfilled = false;}
+        
+        virtual ~GribRecord();
+  
+  
+        static GribRecord *InterpolatedRecord(const GribRecord &rec1, const GribRecord &rec2, double d, bool dir=false);
+        static GribRecord *Interpolated2DRecord(GribRecord *&rety,
+                                                const GribRecord &rec1x, const GribRecord &rec1y,
+                                                const GribRecord &rec2x, const GribRecord &rec2y, double d);
+
+        static GribRecord *MagnitudeRecord(const GribRecord &rec1, const GribRecord &rec2);
+
+        void   multiplyAllData(double k);
+        void Substract(const GribRecord &rec, bool positive=true);
 
         bool  isOk()  const   {return ok;};
         bool  isDataKnown()  const   {return knownData;};
         bool  isEof() const   {return eof;};
-
+        bool  isDuplicated()  const   {return IsDuplicated;};                                          
         //-----------------------------------------
         zuchar  getDataType() const         { return dataType; }
         void    setDataType(const zuchar t);
 
         zuchar  getLevelType() const   { return levelType; }
         zuint   getLevelValue() const  { return levelValue; }
-
-        //-----------------------------------------
-        void    translateDataType();  // adapte les codes des différents centres météo
+        zuint   getDataCenterModel() const { return dataCenterModel; }
         //-----------------------------------------
 
         zuchar   getIdCenter() const  { return idCenter; }
@@ -151,6 +170,8 @@ class GribRecord
         //-----------------------------------------
         int    getPeriodP1() const  { return periodP1; }
         int    getPeriodP2() const  { return periodP2; }
+        zuint  getPeriodSec() const  { return periodsec; }
+        zuchar getTimeRange() const { return timeRange; }
 
         // Number of points in the grid
         int    getNi() const     { return Ni; }
@@ -166,8 +187,13 @@ class GribRecord
                               data[j*Ni+i] = v; }
 
         // Value for one point interpolated
-        double  getInterpolatedValue(double px, double py, bool numericalInterpolation=true) const;
+        double  getInterpolatedValue(double px, double py, bool numericalInterpolation=true, bool dir=false) const;
 
+        // Value for polar interpolation of vectors
+        static bool getInterpolatedValues(double &M, double &A,
+                                          const GribRecord *GRX, const GribRecord *GRY,
+                                          double px, double py, bool numericalInterpolation=true);
+        
         // coordiantes of grid point
         inline double  getX(int i) const   { return ok ? Lo1+i*Di : GRIB_NOTDEF;}
         inline double  getY(int j) const   { return ok ? La1+j*Dj : GRIB_NOTDEF;}
@@ -183,6 +209,9 @@ class GribRecord
         inline bool   isYInMap(double y) const;
         // Is there a value at a particular grid point ?
         inline bool   hasValue(int i, int j) const;
+        // Is there a value that is not GRIB_NOTDEF ?
+        inline bool   isDefined(int i, int j) const
+        { return hasValue(i, j) && getValue(i, j) != GRIB_NOTDEF; }
 
         // Reference date Date (file creation date)
         time_t getRecordRefDate () const         { return refDate; }
@@ -192,54 +221,57 @@ class GribRecord
         time_t getRecordCurrentDate () const     { return curDate; }
         const char* getStrRecordCurDate () const { return strCurDate; }
         void  setRecordCurrentDate (time_t t);
+        void   print();
+        bool isFilled(){ return m_bfilled; }
+        void setFilled(bool val=true){ m_bfilled = val;}
 
+    protected:
+    //private:
+        static bool GetInterpolatedParameters
+            (const GribRecord &rec1, const GribRecord &rec2,
+             double &La1, double &Lo1, double &La2, double &Lo2, double &Di, double &Dj,
+             int &im1, int &jm1, int &im2, int &jm2,
+             int &Ni, int &Nj, int &rec1offi, int &rec1offj, int &rec2offi, int &rec2offj );
 
-
-    private:
         int    id;    // unique identifiant
         bool   ok;    // valid?
         bool   knownData;     // type de donnée connu
+        bool   waveData;
+        bool   IsDuplicated;
         bool   eof;
         std::string dataKey;
         char   strRefDate [32];
         char   strCurDate [32];
+        int    dataCenterModel;
+        bool  m_bfilled;
 
         //---------------------------------------------
         // SECTION 0: THE INDICATOR SECTION (IS)
         //---------------------------------------------
-        zuint  fileOffset0;
-        zuint  seekStart, totalSize;
         zuchar editionNumber;
-        bool   b_len_add_8;
 
         // SECTION 1: THE PRODUCT DEFINITION SECTION (PDS)
-        zuint  fileOffset1;
-        zuint  sectionSize1;
-        zuchar tableVersion;
-        zuchar data1[28];
         zuchar idCenter;
         zuchar idModel;
         zuchar idGrid;
         zuchar dataType;      // octet 9 = parameters and units
         zuchar levelType;
         zuint  levelValue;
-        bool   hasGDS;
+
         bool   hasBMS;
         zuint  refyear, refmonth, refday, refhour, refminute;
-        zuchar periodP1, periodP2;
+        //zuchar periodP1, periodP2;
+        zuint periodP1, periodP2;
         zuchar timeRange;
         zuint  periodsec;     // period in seconds
         time_t refDate;      // C reference date
         time_t curDate;      // C current date
-        double  decimalFactorD;
         // SECTION 2: THE GRID DESCRIPTION SECTION (GDS)
-        zuint  fileOffset2;
-        zuint  sectionSize2;
         zuchar NV, PV;
         zuchar gridType;
         zuint  Ni, Nj;
         double La1, Lo1, La2, Lo2;
-		double latMin, lonMin, latMax, lonMax;
+        double latMin, lonMin, latMax, lonMax;
         double Di, Dj;
         zuchar resolFlags, scanFlags;
         bool  hasDiDj;
@@ -249,52 +281,15 @@ class GribRecord
         bool  isScanJpositive;
         bool  isAdjacentI;
         // SECTION 3: BIT MAP SECTION (BMS)
-        zuint  fileOffset3;
-        zuint  sectionSize3;
+        zuint  BMSsize;
         zuchar *BMSbits;
         // SECTION 4: BINARY DATA SECTION (BDS)
-        zuint  fileOffset4;
-        zuint  sectionSize4;
-        zuchar unusedBitsEndBDS;
-        bool  isGridData;          // not spherical harmonics
-        bool  isSimplePacking;
-        bool  isFloatValues;
-        int   scaleFactorE;
-        double scaleFactorEpow2;
-        double refValue;
-        zuint  nbBitsInPack;
         double  *data;
         // SECTION 5: END SECTION (ES)
 
-        //---------------------------------------------
-        // Data Access
-        //---------------------------------------------
-        bool readGribSection0_IS (ZUFILE* file, bool b_skip_initial_GRIB);
-        bool readGribSection1_PDS(ZUFILE* file);
-        bool readGribSection2_GDS(ZUFILE* file);
-        bool readGribSection3_BMS(ZUFILE* file);
-        bool readGribSection4_BDS(ZUFILE* file);
-        bool readGribSection5_ES (ZUFILE* file);
-
-        //---------------------------------------------
-        // Utility functions
-        //---------------------------------------------
-        zuchar readChar(ZUFILE* file);
-        int    readSignedInt3(ZUFILE* file);
-        int    readSignedInt2(ZUFILE* file);
-        zuint  readInt2(ZUFILE* file);
-        zuint  readInt3(ZUFILE* file);
-        double readFloat4(ZUFILE* file);
-
-        zuint  readPackedBits(zuchar *buf, zuint first, zuint nbBits);
-        zuint  makeInt3(zuchar a, zuchar b, zuchar c);
-        zuint  makeInt2(zuchar b, zuchar c);
-
         time_t makeDate(zuint year,zuint month,zuint day,zuint hour,zuint min,zuint sec);
-        zuint  periodSeconds(zuchar unit, zuchar P1, zuchar P2, zuchar range);
-        void   multiplyAllData(double k);
 
-        void   print();
+//        void   print();
 };
 
 //==========================================================================
@@ -333,10 +328,17 @@ inline bool GribRecord::isXInMap(double x) const
 {
 //    return x>=Lo1 && x<=Lo1+(Ni-1)*Di;
 //printf ("%f %f %f\n", Lo1, Lo2, x);
-    if (Di > 0)
-        return x>=Lo1 && x<=Lo2;
-    else
-        return x>=Lo2 && x<=Lo1;
+    if (Di > 0) {
+        double maxLo = Lo2;
+        if(Lo2+Di >= 360) /* grib that covers the whole world */
+            maxLo += Di;
+        return x>=Lo1 && x<=maxLo;
+    } else {
+        double maxLo = Lo1;
+        if(Lo2+Di >= 360) /* grib that covers the whole world */
+            maxLo += Di;
+        return x>=Lo2 && x<=maxLo;
+    }
 }
 //-----------------------------------------------------------------
 inline bool GribRecord::isYInMap(double y) const

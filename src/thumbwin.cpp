@@ -42,19 +42,7 @@
 #include "thumbwin.h"
 #include "chart1.h"
 #include "chartdb.h"
-#include "chcanv.h"
-
-
-//------------------------------------------------------------------------------
-//    External Static Storage
-//------------------------------------------------------------------------------
-extern ChartDB          *ChartData;
-extern ChartStack       *pCurrentStack;
-
-extern MyFrame          *gFrame;
-extern ChartBase        *Current_Ch;
-extern ChartCanvas      *cc1;
-
+#include "wx28compat.h"
 
 //------------------------------------------------------------------------------
 //    Thumbwin Implementation
@@ -103,11 +91,24 @@ void ThumbWin::OnPaint( wxPaintEvent& event )
             if( pThumbChart->GetThumbData()->pDIBThumb ) dc.DrawBitmap(
                     *( pThumbChart->GetThumbData()->pDIBThumb ), 0, 0, false );
 
-            wxPen ppPen( GetGlobalColor( _T("CHBLK") ), 1, wxSOLID );
+            wxPen ppPen( GetGlobalColor( _T("CHBLK") ), 1, wxPENSTYLE_SOLID );
             dc.SetPen( ppPen );
-            wxBrush yBrush( GetGlobalColor( _T("CHYLW") ), wxSOLID );
+            wxBrush yBrush( GetGlobalColor( _T("CHYLW") ), wxBRUSHSTYLE_SOLID );
             dc.SetBrush( yBrush );
             dc.DrawCircle( pThumbChart->GetThumbData()->ShipX, pThumbChart->GetThumbData()->ShipY, 6 );
         }
     }
 }
+
+const wxBitmap &ThumbWin::GetBitmap(void)
+{
+    if( pThumbChart ) {
+        if( pThumbChart->GetThumbData() ) {
+            if( pThumbChart->GetThumbData()->pDIBThumb )
+                m_bitmap =  *( pThumbChart->GetThumbData()->pDIBThumb );
+        }
+    }
+    
+    return m_bitmap;
+}
+     

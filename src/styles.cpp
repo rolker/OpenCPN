@@ -1,4 +1,4 @@
-/******************************************************************************
+/***************************************************************************
  *
  * Project:  OpenCPN
  * Purpose:  Chart Symbols
@@ -21,9 +21,7 @@
  *   along with this program; if not, write to the                         *
  *   Free Software Foundation, Inc.,                                       *
  *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.         *
- ***************************************************************************
- *
- */
+ **************************************************************************/
 
 #include "wx/wxprec.h"
 
@@ -34,35 +32,75 @@
 #include <wx/filename.h>
 #include <wx/dir.h>
 #include <stdlib.h>
+#include "OCPNPlatform.h"
 
 #include "styles.h"
+#include "chart1.h"
+#include "wx28compat.h"
 
-extern wxString *pHome_Locn;
-extern wxString g_SData_Locn;
+#ifdef ocpnUSE_SVG
+#include "wxsvg/include/wxSVG/svg.h"
+#endif // ocpnUSE_SVG
+
+extern OCPNPlatform     *g_Platform;
 
 using namespace ocpnStyle;
 
-void bmdump( wxBitmap bm, wxString name )
+void bmdump(wxBitmap bm, wxString name)
 {
     wxImage img = bm.ConvertToImage();
     img.SaveFile( name << _T(".png"), wxBITMAP_TYPE_PNG );
 }
 
-// This function can be used to create custom bitmap blending for platforms
+static wxBitmap LoadSVG( const wxString filename, unsigned int width, unsigned int height )
+{
+#ifdef ocpnUSE_SVG
+    wxSVGDocument svgDoc;
+    if( svgDoc.Load(filename) )
+        return wxBitmap( svgDoc.Render( width, height, NULL, true, true ) );
+    else
+        return wxBitmap(width, height);
+#else
+    return wxBitmap(width, height);
+#endif // ocpnUSE_SVG
+}
+
+// This function can be used to create custom bitmap blending for all platforms
 // where 32 bit bitmap ops are broken. Can hopefully be removed for wxWidgets 3.0...
 
 wxBitmap MergeBitmaps( wxBitmap back, wxBitmap front, wxSize offset )
 {
+    //  If the front bitmap has no alpha channel, then merging will accomplish nothing
+    //  So, simply return the bitmap intact
+    //  However, if the bitmaps are different sizes, do the render anyway.
+    wxImage im_front = front.ConvertToImage();
+    if(!im_front.HasAlpha() && (front.GetWidth() == back.GetWidth()) )
+        return front;
+
+#ifdef __WXMSW__
+    //  WxWidgets still has some trouble overlaying bitmaps with transparency.
+    //  This is true on wx2.8 as well as wx3.0
+    //  In the specific case where the back bitmap has alpha, but the front does not,
+    //  we obviously mean for the front to be drawn over the back, with 100% opacity.
+    //  To do this, we need to convert the back bitmap to simple no-alpha model.    
+    if(!im_front.HasAlpha()){
+        wxImage im_back = back.ConvertToImage();
+        back = wxBitmap(im_back);
+    }
+#endif    
+    
     wxBitmap merged( back.GetWidth(), back.GetHeight(), back.GetDepth() );
-#if (defined(__WXGTK__) || defined(__WXMAC__))
+    
+    // Manual alpha blending for broken wxWidgets alpha bitmap support, pervasive in wx2.8.
+    // And also in wx3, at least on Windows...
+#if 1 //!wxCHECK_VERSION(2,9,4) 
 
-    // Manual alpha blending for broken wxWidgets platforms.
-
+#if !wxCHECK_VERSION(2,9,4) 
     merged.UseAlpha();
     back.UseAlpha();
     front.UseAlpha();
-
-    wxImage im_front = front.ConvertToImage();
+#endif    
+    
     wxImage im_back = back.ConvertToImage();
     wxImage im_result = back.ConvertToImage();// Only way to make result have alpha channel in wxW 2.8.
 
@@ -72,54 +110,58 @@ wxBitmap MergeBitmaps( wxBitmap back, wxBitmap front, wxSize offset )
 
     unsigned char *afront = NULL;
     if( im_front.HasAlpha() )
-    afront = im_front.GetAlpha();
+        afront = im_front.GetAlpha();
 
     unsigned char *aback = NULL;
     if( im_back.HasAlpha() )
-    aback = im_back.GetAlpha();
+        aback = im_back.GetAlpha();
 
     unsigned char *aresult = NULL;
     if( im_result.HasAlpha() )
-    aresult = im_result.GetAlpha();
+        aresult = im_result.GetAlpha();
 
     // Do alpha blending, associative version of "over" operator.
+    if(presult && pback && pfront){ 
+        for( int i = 0; i < back.GetHeight(); i++ ) {
+            for( int j = 0; j < back.GetWidth(); j++ ) {
 
-    for( int i = 0; i < back.GetHeight(); i++ ) {
-        for( int j = 0; j < back.GetWidth(); j++ ) {
+                int fX = j - offset.x;
+                int fY = i - offset.y;
 
-            int fX = j - offset.x;
-            int fY = i - offset.y;
+                bool inFront = true;
+                if( fX < 0 || fY < 0 ) inFront = false;
+                if( fX >= front.GetWidth() ) inFront = false;
+                if( fY >= front.GetHeight() ) inFront = false;
 
-            bool inFront = true;
-            if( fX < 0 || fY < 0 ) inFront = false;
-            if( fX >= front.GetWidth() ) inFront = false;
-            if( fY >= front.GetHeight() ) inFront = false;
-
-            if( inFront ) {
-                double alphaF = (double) ( *afront++ ) / 256.0;
-                double alphaB = (double) ( *aback++ ) / 256.0;
-                double alphaRes = alphaF + alphaB * ( 1.0 - alphaF );
-                unsigned char a = alphaRes * 256;
-                *aresult++ = a;
-                unsigned char r = (*pfront++ * alphaF + *pback++ * alphaB * ( 1.0 - alphaF )) / alphaRes;
-                *presult++ = r;
-                unsigned char g = (*pfront++ * alphaF + *pback++ * alphaB * ( 1.0 - alphaF )) / alphaRes;
-                *presult++ = g;
-                unsigned char b = (*pfront++ * alphaF + *pback++ * alphaB * ( 1.0 - alphaF )) / alphaRes;
-                *presult++ = b;
-            } else {
-                *aresult++ = *aback++;
-                *presult++ = *pback++;
-                *presult++ = *pback++;
-                *presult++ = *pback++;
+                if( inFront ) {
+                    double alphaF = 1.0;
+                    if (afront) alphaF = (double) ( *afront++ ) / 255.0;
+                    double alphaB = 1.0;
+                    if (aback) alphaB = (double) ( *aback++ ) / 255.0;
+                    double alphaRes = alphaF + alphaB * ( 1.0 - alphaF );
+                    if (aresult) {
+                        unsigned char a = alphaRes * 255;
+                        *aresult++ = a;
+                    }
+                    unsigned char r = (*pfront++ * alphaF + *pback++ * alphaB * ( 1.0 - alphaF )) / alphaRes;
+                    *presult++ = r;
+                    unsigned char g = (*pfront++ * alphaF + *pback++ * alphaB * ( 1.0 - alphaF )) / alphaRes;
+                    *presult++ = g;
+                    unsigned char b = (*pfront++ * alphaF + *pback++ * alphaB * ( 1.0 - alphaF )) / alphaRes;
+                    *presult++ = b;
+                } else {
+                    if (aresult && aback) *aresult++ = *aback++;
+                    *presult++ = *pback++;
+                    *presult++ = *pback++;
+                    *presult++ = *pback++;
+                }
             }
         }
     }
-
     merged = wxBitmap( im_result );
-
 #else
     wxMemoryDC mdc( merged );
+    mdc.Clear();
     mdc.DrawBitmap( back, 0, 0, true );
     mdc.DrawBitmap( front, offset.x, offset.y, true );
     mdc.SelectObject( wxNullBitmap );
@@ -135,40 +177,51 @@ wxBitmap MergeBitmaps( wxBitmap back, wxBitmap front, wxSize offset )
 wxBitmap ConvertTo24Bit( wxColor bgColor, wxBitmap front ) {
     if( front.GetDepth() == 24 ) return front;
 
-    wxBitmap result( front.GetWidth(), front.GetHeight(), 24 );
+#if !wxCHECK_VERSION(2,9,4)
     front.UseAlpha();
+#endif
 
     wxImage im_front = front.ConvertToImage();
-    wxImage im_result = result.ConvertToImage();
-
-    unsigned char *presult = im_result.GetData();
     unsigned char *pfront = im_front.GetData();
+    if(!pfront)
+        return wxNullBitmap;
+    
+    unsigned char *presult = (unsigned char *)malloc(front.GetWidth() * front.GetHeight() * 3);
+    if(!presult)
+        return wxNullBitmap;
+    
+    unsigned char *po_result = presult;
 
+    
     unsigned char *afront = NULL;
     if( im_front.HasAlpha() )
     afront = im_front.GetAlpha();
 
-    for( int i = 0; i < result.GetWidth(); i++ ) {
-        for( int j = 0; j < result.GetHeight(); j++ ) {
+    for( int i = 0; i < front.GetWidth(); i++ ) {
+        for( int j = 0; j < front.GetHeight(); j++ ) {
 
-            double alphaF = (double) ( *afront++ ) / 256.0;
-            unsigned char r = *pfront++ * alphaF + bgColor.Red() * ( 1.0 - alphaF );
-            *presult++ = r;
-            unsigned char g = *pfront++ * alphaF + bgColor.Green() * ( 1.0 - alphaF );
-            *presult++ = g;
-            unsigned char b = *pfront++ * alphaF + bgColor.Blue() * ( 1.0 - alphaF );
-            *presult++ = b;
+            double alphaF = 1.0;
+            if(afront)
+                alphaF = (double) ( *afront++ ) / 256.0;
+             unsigned char r = *pfront++ * alphaF + bgColor.Red() * ( 1.0 - alphaF );
+             *presult++ = r;
+             unsigned char g = *pfront++ * alphaF + bgColor.Green() * ( 1.0 - alphaF );
+             *presult++ = g;
+             unsigned char b = *pfront++ * alphaF + bgColor.Blue() * ( 1.0 - alphaF );
+             *presult++ = b;
         }
     }
 
-    result = wxBitmap( im_result );
+    wxImage im_result(front.GetWidth(), front.GetHeight(), po_result);
+    
+    wxBitmap result = wxBitmap( im_result );
     return result;
 }
 
 // Tools and Icons perform on-demand loading and dimming of bitmaps.
 // Changing color scheme invalidatres all loaded bitmaps.
 
-wxBitmap Style::GetIcon( wxString name )
+wxBitmap Style::GetIcon(const wxString & name, int width, int height, bool bforceReload)
 {
     if( iconIndex.find( name ) == iconIndex.end() ) {
         wxString msg( _T("The requested icon was not found in the style: ") );
@@ -177,24 +230,48 @@ wxBitmap Style::GetIcon( wxString name )
         return wxBitmap( GetToolSize().x, GetToolSize().y ); // Prevents crashing.
     }
 
-    int index = iconIndex[name];
+    int index = iconIndex[name]; // FIXME: this operation is not const but should be, use 'find'
 
     Icon* icon = (Icon*) icons.Item( index );
 
-    if( icon->loaded ) return icon->icon;
-    if( icon->size.x == 0 ) icon->size = toolSize[currentOrientation];
-    wxRect location( icon->iconLoc, icon->size );
-    wxBitmap bm = graphics->GetSubBitmap( location );
+    if( icon->loaded && !bforceReload)
+        return icon->icon;
+    if( icon->size.x == 0 )
+        icon->size = toolSize[currentOrientation];
+    
+    wxSize retSize = icon->size;
+    if((width > 0) && (height > 0))
+        retSize = wxSize(width, height);
+    
+    wxBitmap bm;
+#ifdef ocpnUSE_SVG
+    wxString fullFilePath = myConfigFileDir + this->sysname + wxFileName::GetPathSeparator() + name + _T(".svg");
+    if( wxFileExists( fullFilePath ) )
+        bm = LoadSVG( fullFilePath, retSize.x, retSize.y);
+    else
+    {
+///        wxLogMessage( _T("Can't find SVG icon: ") + fullFilePath );
+#endif // ocpnUSE_SVG
+        wxRect location( icon->iconLoc, icon->size );
+        bm = graphics->GetSubBitmap( location );
+        if(retSize != icon->size){
+            wxImage scaled_image = bm.ConvertToImage();
+            bm = wxBitmap(scaled_image.Scale(retSize.x, retSize.y, wxIMAGE_QUALITY_HIGH));
+        }
+        
+#ifdef ocpnUSE_SVG
+    }
+#endif // ocpnUSE_SVG
     icon->icon = SetBitmapBrightness( bm );
     icon->loaded = true;
     return icon->icon;
 }
 
-wxBitmap Style::GetToolIcon( wxString toolname, int iconType, bool rollover )
+wxBitmap Style::GetToolIcon(const wxString & toolname, int iconType, bool rollover, int width, int height )
 {
 
     if( toolIndex.find( toolname ) == toolIndex.end() ) {
-//  This will produce a flood of log messages for some PlugIns, notably WMM_PI, and GRADAR_PI        
+//  This will produce a flood of log messages for some PlugIns, notably WMM_PI, and GRADAR_PI
 //        wxString msg( _T("The requested tool was not found in the style: ") );
 //        msg += toolname;
 //        wxLogMessage( msg );
@@ -204,44 +281,85 @@ wxBitmap Style::GetToolIcon( wxString toolname, int iconType, bool rollover )
     int index = toolIndex[toolname];
 
     Tool* tool = (Tool*) tools.Item( index );
-
+ 
+    wxSize size = tool->customSize;
+    if( size.x == 0 )
+        size = toolSize[currentOrientation];
+    
+    wxSize retSize = size;
+    if((width > 0) && (height > 0))
+        retSize = wxSize(width, height);
+    
     switch( iconType ){
         case TOOLICON_NORMAL: {
             if( tool->iconLoaded && !rollover ) return tool->icon;
             if( tool->rolloverLoaded && rollover ) return tool->rollover;
 
-            wxSize size = tool->customSize;
-            if( size.x == 0 ) size = toolSize[currentOrientation];
             wxRect location( tool->iconLoc, size );
-            
+
             //  If rollover icon does not exist, use the defult icon
             if( rollover ) {
                 if( (tool->rolloverLoc.x != 0) || (tool->rolloverLoc.y != 0) )
                     location = wxRect( tool->rolloverLoc, size );
-            }                    
+            }
 
             if( currentOrientation ) {
                 location.x -= verticalIconOffset.x;
                 location.y -= verticalIconOffset.y;
             }
 
-            wxBitmap bm = graphics->GetSubBitmap( location );
-            if( hasBackground ) {
-                bm = MergeBitmaps( GetNormalBG(), bm, wxSize( 0, 0 ) );
-            } else {
-                wxBitmap bg( GetToolSize().x, GetToolSize().y );
-                wxMemoryDC mdc( bg );
-                mdc.SetBackground( wxBrush( GetGlobalColor( _T("GREY2") ), wxSOLID ) );
-                mdc.Clear();
-                mdc.SelectObject( wxNullBitmap );
-                bm = MergeBitmaps( bg, bm, wxSize( 0, 0 ) );
+            wxBitmap bm;
+#ifdef ocpnUSE_SVG
+            wxString fullFilePath;
+            if( rollover )
+                fullFilePath = myConfigFileDir + this->sysname + wxFileName::GetPathSeparator() + toolname + _T("_rollover.svg");
+            else
+                fullFilePath = myConfigFileDir + this->sysname + wxFileName::GetPathSeparator() + toolname + _T(".svg");
+            if( wxFileExists( fullFilePath ) )
+                bm = LoadSVG( fullFilePath, retSize.x, retSize.y );
+            else
+            {
+                ///wxLogMessage( _T("Can't find SVG: ") + fullFilePath );
+#endif // ocpnUSE_SVG
+                bm = graphics->GetSubBitmap( location );
+                
+                if( hasBackground ) {
+                    bm = MergeBitmaps( GetNormalBG(), bm, wxSize( 0, 0 ) );
+                } else {
+                    wxBitmap bg( GetToolSize().x, GetToolSize().y );
+                    wxMemoryDC mdc( bg );
+                    mdc.SetBackground( wxBrush( GetGlobalColor( _T("GREY2") ), wxBRUSHSTYLE_SOLID ) );
+                    mdc.Clear();
+                    mdc.SelectObject( wxNullBitmap );
+                    bm = MergeBitmaps( bg, bm, wxSize( 0, 0 ) );
+                }
+                
+                if(retSize != size){
+                    wxImage scaled_image = bm.ConvertToImage();
+                    bm = wxBitmap(scaled_image.Scale(retSize.x, retSize.y, wxIMAGE_QUALITY_HIGH));
+                }
+                
+#ifdef ocpnUSE_SVG
             }
+#endif // ocpnUSE_SVG
+
             if( rollover ) {
                 tool->rollover = SetBitmapBrightness( bm );
                 tool->rolloverLoaded = true;
                 return tool->rollover;
             } else {
-                tool->icon = SetBitmapBrightness( bm );
+                if( toolname == _T("mob_btn") ) {
+                    double dimLevel = 1.0;
+                    if(colorscheme ==  GLOBAL_COLOR_SCHEME_DUSK)
+                        dimLevel = 0.5;
+                    else if(colorscheme ==  GLOBAL_COLOR_SCHEME_NIGHT)
+                        dimLevel = 0.5;
+                    tool->icon = SetBitmapBrightnessAbs( bm, dimLevel );
+                }
+                else {
+                    tool->icon = SetBitmapBrightness( bm );
+                }
+                
                 tool->iconLoaded = true;
                 return tool->icon;
             }
@@ -250,8 +368,6 @@ wxBitmap Style::GetToolIcon( wxString toolname, int iconType, bool rollover )
             if( tool->toggledLoaded && !rollover ) return tool->toggled;
             if( tool->rolloverToggledLoaded && rollover ) return tool->rolloverToggled;
 
-            wxSize size = tool->customSize;
-            if( size.x == 0 ) size = toolSize[currentOrientation];
             wxRect location( tool->iconLoc, size );
             if( rollover ) location = wxRect( tool->rolloverLoc, size );
             wxSize offset( 0, 0 );
@@ -263,8 +379,46 @@ wxBitmap Style::GetToolIcon( wxString toolname, int iconType, bool rollover )
                 location.x -= verticalIconOffset.x;
                 location.y -= verticalIconOffset.y;
             }
-            wxBitmap bm = MergeBitmaps( GetToggledBG(), graphics->GetSubBitmap( location ),
-                    offset );
+            wxBitmap bm;
+#ifdef ocpnUSE_SVG
+            wxString fullFilePath;
+            if( rollover )
+                fullFilePath = myConfigFileDir + this->sysname + wxFileName::GetPathSeparator() + toolname + _T("_rollover_toggled.svg");
+            else
+                fullFilePath = myConfigFileDir + this->sysname + wxFileName::GetPathSeparator() + toolname + _T("_toggled.svg");
+            if( wxFileExists( fullFilePath ) )
+                bm = LoadSVG( fullFilePath, retSize.x, retSize.y );
+            else
+            {
+                // Could not find a toggled SVG, so try to make one
+                if( rollover )
+                    fullFilePath = myConfigFileDir + this->sysname + wxFileName::GetPathSeparator() + toolname + _T("_rollover.svg");
+                else
+                    fullFilePath = myConfigFileDir + this->sysname + wxFileName::GetPathSeparator() + toolname + _T(".svg");
+
+                if( wxFileExists( fullFilePath ) ){
+                    bm = LoadSVG( fullFilePath, retSize.x, retSize.y );
+                    
+                    wxBitmap bmBack = GetToggledBG();
+                    if( (bmBack.GetWidth() != retSize.x) || (bmBack.GetHeight() != retSize.y) ){
+                        wxImage scaled_back = bmBack.ConvertToImage();
+                        bmBack = wxBitmap(scaled_back.Scale(retSize.x, retSize.y, wxIMAGE_QUALITY_HIGH));
+                    }
+                    bm = MergeBitmaps( bmBack, bm, wxSize(0,0) );
+                }
+            }
+                
+#endif // ocpnUSE_SVG
+            if(!bm.Ok()){
+                bm = graphics->GetSubBitmap( location );
+                bm = MergeBitmaps( GetToggledBG(), bm, offset );
+                
+                if(retSize != size){
+                    wxImage scaled_image = bm.ConvertToImage();
+                    bm = wxBitmap(scaled_image.Scale(retSize.x, retSize.y, wxIMAGE_QUALITY_HIGH));
+                }
+            }
+                
             if( rollover ) {
                 tool->rolloverToggled = SetBitmapBrightness( bm );
                 tool->rolloverToggledLoaded = true;
@@ -277,16 +431,33 @@ wxBitmap Style::GetToolIcon( wxString toolname, int iconType, bool rollover )
         }
         case TOOLICON_DISABLED: {
             if( tool->disabledLoaded ) return tool->disabled;
-            wxSize size = tool->customSize;
-            if( size.x == 0 ) size = toolSize[currentOrientation];
             wxRect location( tool->disabledLoc, size );
-            wxBitmap bm = graphics->GetSubBitmap( location );
+
+            wxBitmap bm;
+#ifdef ocpnUSE_SVG
+            wxString fullFilePath = myConfigFileDir + this->sysname + wxFileName::GetPathSeparator() + toolname + _T("_disabled.svg");
+            if( wxFileExists( fullFilePath ) )
+                bm = LoadSVG( fullFilePath, retSize.x, retSize.y );
+            else
+            {
+                ///wxLogMessage( _T("Can't find SVG: ") + fullFilePath );
+#endif // ocpnUSE_SVG
+                bm = graphics->GetSubBitmap( location );
+                
+                if( hasBackground ) {
+                    bm = MergeBitmaps( GetNormalBG(), bm, wxSize( 0, 0 ) );
+                }
+                
+                if(retSize != size){
+                    wxImage scaled_image = bm.ConvertToImage();
+                    bm = wxBitmap(scaled_image.Scale(retSize.x, retSize.y, wxIMAGE_QUALITY_HIGH));
+                }
+#ifdef ocpnUSE_SVG
+            }
+#endif // ocpnUSE_SVG
             if( currentOrientation ) {
                 location.x -= verticalIconOffset.x;
                 location.y -= verticalIconOffset.y;
-            }
-            if( hasBackground ) {
-                bm = MergeBitmaps( GetNormalBG(), bm, wxSize( 0, 0 ) );
             }
             tool->disabled = SetBitmapBrightness( bm );
             tool->disabledLoaded = true;
@@ -299,38 +470,65 @@ wxBitmap Style::GetToolIcon( wxString toolname, int iconType, bool rollover )
     return wxBitmap( GetToolSize().x, GetToolSize().y ); // Prevents crashing.
 }
 
-wxBitmap Style::BuildPluginIcon( const wxBitmap* bm, int iconType )
+wxBitmap Style::BuildPluginIcon( const wxBitmap* bm, int iconType, double factor )
 {
 	if( ! bm || ! bm->IsOk() ) return wxNullBitmap;
 
     wxBitmap iconbm;
 
     switch( iconType ){
-        case TOOLICON_NORMAL: {
+        case TOOLICON_NORMAL:
+        case TOOLICON_TOGGLED:
+            {
             if( hasBackground ) {
-                wxBitmap bg = GetNormalBG();
-                bg = SetBitmapBrightness( bg );
-                wxSize offset = wxSize( bg.GetWidth() - bm->GetWidth(), bg.GetHeight() - bm->GetHeight() );
-                offset /= 2;
-                iconbm = MergeBitmaps( bg, *bm, offset );
+                wxBitmap bg;
+                if(iconType == TOOLICON_NORMAL)
+                    bg = GetNormalBG();
+                else
+                    bg = GetToggledBG();
+
+                if((bg.GetWidth() >= bm->GetWidth()) && (bg.GetHeight() >= bm->GetHeight())){
+                    int w = bg.GetWidth() * factor;
+                    int h = bg.GetHeight() * factor;
+                    wxImage scaled_image = bg.ConvertToImage();
+                    bg = wxBitmap(scaled_image.Scale(w, h, wxIMAGE_QUALITY_HIGH));
+                    
+                    wxSize offset = wxSize( bg.GetWidth() - bm->GetWidth(), bg.GetHeight() - bm->GetHeight() );
+                    offset /= 2;
+                    iconbm = MergeBitmaps( bg, *bm, offset );
+                }
+                else{
+                    // A bit of contorted logic for non-square backgrounds...
+                    double factor = ((double)bm->GetHeight()) / bg.GetHeight();
+                    int nw = bg.GetWidth() * factor;
+                    int nh = bm->GetHeight();
+                    if(bg.GetWidth() == bg.GetHeight())
+                        nw = nh;
+                    wxImage scaled_image = bg.ConvertToImage();
+                    bg = wxBitmap(scaled_image.Scale(nw, nh, wxIMAGE_QUALITY_HIGH));
+                    
+                    wxSize offset = wxSize( bg.GetWidth() - bm->GetWidth(), bg.GetHeight() - bm->GetHeight() );
+                    offset /= 2;
+                    iconbm = MergeBitmaps( bg, *bm, offset );
+                }
+                
             } else {
                 wxBitmap bg( GetToolSize().x, GetToolSize().y );
                 wxMemoryDC mdc( bg );
                 wxSize offset = GetToolSize() - wxSize( bm->GetWidth(), bm->GetHeight() );
                 offset /= 2;
-                mdc.SetBackground( wxBrush( GetGlobalColor( _T("GREY2") ), wxSOLID ) );
+                mdc.SetBackground( wxBrush( GetGlobalColor( _T("GREY2") ), wxBRUSHSTYLE_SOLID ) );
                 mdc.Clear();
                 mdc.SelectObject( wxNullBitmap );
                 iconbm = MergeBitmaps( bg, *bm, offset );
             }
             break;
         }
-        case TOOLICON_TOGGLED: {
-            iconbm = MergeBitmaps( GetToggledBG(), *bm, wxSize( 0, 0 ) );
+        default:
+            return wxNullBitmap;
             break;
-        }
     }
-    return iconbm;
+    return SetBitmapBrightness( iconbm );
 }
 
 wxBitmap Style::SetBitmapBrightness( wxBitmap& bitmap )
@@ -349,7 +547,12 @@ wxBitmap Style::SetBitmapBrightness( wxBitmap& bitmap )
             return bitmap;
         }
     }
+    
+    return SetBitmapBrightnessAbs(bitmap, dimLevel);
+}
 
+wxBitmap Style::SetBitmapBrightnessAbs( wxBitmap& bitmap, double level )
+{
     wxImage image = bitmap.ConvertToImage();
 
     int gimg_width = image.GetWidth();
@@ -361,7 +564,7 @@ wxBitmap Style::SetBitmapBrightness( wxBitmap& bitmap )
                 wxImage::RGBValue rgb( image.GetRed( ix, iy ), image.GetGreen( ix, iy ),
                         image.GetBlue( ix, iy ) );
                 wxImage::HSVValue hsv = wxImage::RGBtoHSV( rgb );
-                hsv.value = hsv.value * dimLevel;
+                hsv.value = hsv.value * level;
                 wxImage::RGBValue nrgb = wxImage::HSVtoRGB( hsv );
                 image.SetRGB( ix, iy, nrgb.red, nrgb.green, nrgb.blue );
             }
@@ -417,22 +620,41 @@ int Style::GetToolbarCornerRadius()
     return cornerRadius[currentOrientation];
 }
 
-void Style::DrawToolbarLineStart( wxBitmap& bmp )
+void Style::DrawToolbarLineStart( wxBitmap& bmp, double scale )
 {
     if( !HasToolbarStart() ) return;
     wxMemoryDC dc( bmp );
-    dc.DrawBitmap( GetToolbarStart(), 0, 0, true );
+    wxBitmap sbmp = GetToolbarStart();
+    if( fabs(scale - 1.0) > 0.01){
+        int h = sbmp.GetHeight() * scale;
+        int w = sbmp.GetWidth() * scale;
+        if( (h > 0) && (w > 0)){
+            wxImage scaled_image = sbmp.ConvertToImage();
+            sbmp = wxBitmap(scaled_image.Scale(w, h, wxIMAGE_QUALITY_HIGH));
+        }
+    }
+    dc.DrawBitmap( sbmp, 0, 0, true );
     dc.SelectObject( wxNullBitmap );
 }
 
-void Style::DrawToolbarLineEnd( wxBitmap& bmp )
+void Style::DrawToolbarLineEnd( wxBitmap& bmp, double scale )
 {
     if( !HasToolbarStart() ) return;
     wxMemoryDC dc( bmp );
+    wxBitmap sbmp = GetToolbarEnd();
+    if( fabs(scale - 1.0) > 0.01){
+        int h = sbmp.GetHeight() * scale;
+        int w = sbmp.GetWidth() * scale;
+        if( (h > 0) && (w > 0)){
+            wxImage scaled_image = sbmp.ConvertToImage();
+            sbmp = wxBitmap(scaled_image.Scale(w, h, wxIMAGE_QUALITY_HIGH));
+        }
+    }
+    
     if( currentOrientation ) {
-        dc.DrawBitmap( GetToolbarEnd(), 0, bmp.GetHeight() - GetToolbarEnd().GetHeight(), true );
+        dc.DrawBitmap( sbmp, 0, bmp.GetHeight() - sbmp.GetHeight(), true );
     } else {
-        dc.DrawBitmap( GetToolbarEnd(), bmp.GetWidth() - GetToolbarEnd().GetWidth(), 0, true );
+        dc.DrawBitmap( sbmp, bmp.GetWidth() - sbmp.GetWidth(), 0, true );
     }
     dc.SelectObject( wxNullBitmap );
 }
@@ -527,17 +749,22 @@ Style::~Style( void )
     iconIndex.clear();
 }
 
-StyleManager::StyleManager( void )
+StyleManager::StyleManager(void)
 {
     isOK = false;
     currentStyle = NULL;
-    Init( g_SData_Locn + _T("uidata") + wxFileName::GetPathSeparator() );
-    Init( *pHome_Locn );
-    Init( *pHome_Locn + _T(".opencpn") + wxFileName::GetPathSeparator() );
+    Init( g_Platform->GetSharedDataDir() + _T("uidata") + wxFileName::GetPathSeparator() );
+    Init( g_Platform->GetHomeDir() );
+    Init( g_Platform->GetHomeDir() + _T(".opencpn") + wxFileName::GetPathSeparator() );
     SetStyle( _T("") );
+#ifdef ocpnUSE_SVG
+    wxLogMessage(_T("Using SVG Icons"));
+#else
+    wxLogMessage(_T("Using PNG Icons"));
+#endif    
 }
 
-StyleManager::StyleManager( wxString& configDir )
+StyleManager::StyleManager(const wxString & configDir)
 {
     isOK = false;
     currentStyle = NULL;
@@ -545,7 +772,7 @@ StyleManager::StyleManager( wxString& configDir )
     SetStyle( _T("") );
 }
 
-StyleManager::~StyleManager( void )
+StyleManager::~StyleManager(void)
 {
     for( unsigned int i = 0; i < styles.Count(); i++ ) {
         delete (Style*) ( styles.Item( i ) );
@@ -553,7 +780,7 @@ StyleManager::~StyleManager( void )
     styles.Clear();
 }
 
-void StyleManager::Init( wxString fromPath )
+void StyleManager::Init(const wxString & fromPath)
 {
     TiXmlDocument doc;
 
@@ -619,6 +846,7 @@ void StyleManager::Init( wxString fromPath )
                 styles.Add( style );
 
                 style->name = wxString( styleElem->Attribute( "name" ), wxConvUTF8 );
+                style->sysname = wxString( styleElem->Attribute( "sysname" ), wxConvUTF8 );
                 style->myConfigFileDir = fromPath;
 
                 TiXmlElement* subNode = styleElem->FirstChild()->ToElement();
@@ -886,7 +1114,7 @@ void StyleManager::Init( wxString fromPath )
     }
 }
 
-void StyleManager::SetStyle( wxString name )
+void StyleManager::SetStyle(wxString name)
 {
     Style* style = NULL;
     bool ok = true;

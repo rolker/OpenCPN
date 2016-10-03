@@ -1,4 +1,4 @@
-/******************************************************************************
+/***************************************************************************
  *
  * Project:  OpenCPN
  * Purpose:  Chart Symbols
@@ -21,14 +21,13 @@
  *   along with this program; if not, write to the                         *
  *   Free Software Foundation, Inc.,                                       *
  *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.         *
- ***************************************************************************
- *
- */
+ **************************************************************************/
 
 #pragma once
 
 #include "s52plib.h"
 #include <tinyxml.h>
+#include "pugixml.hpp"
 
 
 class Lookup {
@@ -107,20 +106,21 @@ class ChartSymbols
 public:
 	ChartSymbols(void);
 	~ChartSymbols(void);
-	bool LoadConfigFile( s52plib* plibArg, wxString path );
+	bool LoadConfigFile(s52plib* plibArg, const wxString & path);
 
 	static void InitializeGlobals( void );
 	static void DeleteGlobals( void );
-	static int LoadRasterFileForColorTable( int tableNo );
+	static int LoadRasterFileForColorTable( int tableNo, bool flush=false );
 	static wxArrayPtrVoid * GetColorTables();
-	static int FindColorTable( wxString& tableName );
+	static int FindColorTable(const wxString & tableName);
 	static S52color* GetColor( const char *colorName, int fromTable );
 	static wxColor GetwxColor( const wxString &colorName, int fromTable );
 	static wxColor GetwxColor( const char *colorName, int fromTable );
 	static wxString HashKey( const char* symbolName );
 	static wxImage GetImage( const char* symbolName );
-
-
+        static unsigned int GetGLTextureRect( wxRect &rect, const char* symbolName );
+        static wxSize GLTextureSize();
+        static void SetColorTableIndex( int index );
 private:
       void ProcessVectorTag( TiXmlElement* subNodes, SymbolSizeInfo_t &vectorSize );
       void ProcessColorTables( TiXmlElement* colortableodes );
@@ -128,11 +128,20 @@ private:
       void ProcessLinestyles( TiXmlElement* linestyleNodes );
       void ProcessPatterns( TiXmlElement* patternNodes );
       void ProcessSymbols( TiXmlElement* symbolNodes );
-	void BuildLineStyle( LineStyle &lineStyle );
-	void BuildLookup( Lookup &lookup );
-	void BuildPattern( OCPNPattern &pattern );
-	void BuildSymbol( ChartSymbol &symol );
+      void BuildLineStyle( LineStyle &lineStyle );
+      void BuildLookup( Lookup &lookup );
+      void BuildPattern( OCPNPattern &pattern );
+      void BuildSymbol( ChartSymbol &symol );
+       
+      void ProcessColorTables( pugi::xml_node &node );
+      void ProcessLookups( pugi::xml_node &node );
+      void ProcessLinestyles( pugi::xml_node &node );
+      void ProcessPatterns( pugi::xml_node &node );
+      void ProcessSymbols( pugi::xml_node &node );
+      void ProcessVectorTag( pugi::xml_node &vectorNode, SymbolSizeInfo_t &vectorSize );
+      
+      pugi::xml_document m_symbolsDoc;
 
-	s52plib* plib;
+      s52plib* plib;
 };
 

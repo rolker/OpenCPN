@@ -1,11 +1,11 @@
-/******************************************************************************
+/***************************************************************************
  *
  * Project:  OpenCPN
  * Purpose:  S57 Chart Object
  * Author:   David Register
  *
  ***************************************************************************
- *   Copyright (C) 2010 by David S. Register   *
+ *   Copyright (C) 2010 by David S. Register                               *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
  *   it under the terms of the GNU General Public License as published by  *
@@ -20,11 +20,8 @@
  *   You should have received a copy of the GNU General Public License     *
  *   along with this program; if not, write to the                         *
  *   Free Software Foundation, Inc.,                                       *
- *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.             *
- ***************************************************************************
- *
- */
-
+ *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,  USA.         *
+ **************************************************************************/
 
 // For compilers that support precompilation, includes "wx.h".
 #include "wx/wxprec.h"
@@ -38,6 +35,7 @@
 #include <wx/textfile.h>
 
 #include "dychart.h"
+#include "OCPNPlatform.h"
 
 #include "s52s57.h"
 #include "s52plib.h"
@@ -50,11 +48,18 @@
 #include "navutil.h"                            // for LogMessageOnce
 #include "ocpn_pixel.h"
 #include "ocpndc.h"
+#include "s52utils.h"
+#include "wx28compat.h"
+#include "ChartDataInputStream.h"
 
 #include "cpl_csv.h"
 #include "setjmp.h"
 
 #include "mygdal/ogr_s57.h"
+
+#include "pluginmanager.h"                      // for S57 lights overlay
+
+#include "Osenc.h"
 
 #ifdef __MSVC__
 #define _CRTDBG_MAP_ALLOC
@@ -64,19 +69,33 @@
 #define new DEBUG_NEW
 #endif
 
+#ifdef ocpnUSE_GL
+#include "glChartCanvas.h"
+#endif
+
 #include <algorithm>          // for std::sort
+#include <map>
+#include <unordered_map>
+
+#include "ssl/sha1.h"
+
+#ifdef __MSVC__
+#define strncasecmp(x,y,z) _strnicmp(x,y,z)
+#endif
+
 
 extern bool GetDoubleAttr(S57Obj *obj, const char *AttrName, double &val);      // found in s52cnsy
-
 
 void OpenCPN_OGRErrorHandler( CPLErr eErrClass, int nError,
                               const char * pszErrorMsg );               // installed GDAL OGR library error handler
 
-const char *MyCSVGetField( const char * pszFilename,
-                         const char * pszKeyFieldName,
-                         const char * pszKeyFieldValue,
-                         CSVCompareCriteria eCriteria,
-                         const char * pszTargetField ) ;
+
+#ifdef ocpnUSE_GL
+extern PFNGLGENBUFFERSPROC                 s_glGenBuffers;
+extern PFNGLBINDBUFFERPROC                 s_glBindBuffer;
+extern PFNGLBUFFERDATAPROC                 s_glBufferData;
+extern PFNGLDELETEBUFFERSPROC              s_glDeleteBuffers;
+#endif
 
 
 extern s52plib           *ps52plib;
@@ -86,12 +105,16 @@ extern wxString          g_SENCPrefix;
 extern FILE              *s_fpdebug;
 extern bool              g_bGDAL_Debug;
 extern bool              g_bDebugS57;
-extern bool              g_b_useStencil;
 extern ChartCanvas       *cc1;
 extern ChartBase         *Current_Ch;
 extern MyFrame*          gFrame;
+extern PlugInManager     *g_pi_manager;
+extern bool              g_b_overzoom_x;
+extern bool              g_b_EnableVBO;
 
 extern wxProgressDialog *s_ProgDialog;
+
+int                      g_SENC_LOD_pixels;
 
 static jmp_buf env_ogrf;                    // the context saved by setjmp();
 
@@ -123,14 +146,126 @@ static bool s_ProgressCallBack( void )
     return ret;
 }
 
+static uint64_t hash_fast64(const void *buf, size_t len, uint64_t seed)
+{
+    const uint64_t	m = 0x880355f21e6d1965ULL;
+    const uint64_t *pos = (const uint64_t *)buf;
+    const uint64_t *end = pos + (len >> 3);
+    const unsigned char *pc;
+    uint64_t h = len * m ^ seed;
+    uint64_t v;
+    while (pos != end) {
+        v = *pos++;
+        v ^= v >> 23;
+        v *= 0x2127599bf4325c37ULL;
+        h ^= v ^ (v >> 47);
+        h *= m;
+    }
+    pc = (const unsigned char*)pos;
+    v = 0;
+    switch (len & 7) {
+        case 7: v ^= (uint64_t)pc[6] << 48;
+        case 6: v ^= (uint64_t)pc[5] << 40;
+        case 5: v ^= (uint64_t)pc[4] << 32;
+        case 4: v ^= (uint64_t)pc[3] << 24;
+        case 3: v ^= (uint64_t)pc[2] << 16;
+        case 2: v ^= (uint64_t)pc[1] << 8;
+        case 1: v ^= (uint64_t)pc[0];
+            v ^= v >> 23;
+            v *= 0x2127599bf4325c37ULL;
+            h ^= v ^ (v >> 47);
+            h *= m;
+    }
+
+    h ^= h >> 23;
+    h *= 0x2127599bf4325c37ULL;
+    h ^= h >> 47;
+    return h;
+}
+
+static unsigned int hash_fast32(const void *buf, size_t len, unsigned int seed)
+{
+    uint64_t h = hash_fast64(buf, len, seed);
+    /* The following trick converts the 64-bit hashcode to a
+     * residue over a Fermat Number, in which information from
+     * both the higher and lower parts of hashcode shall be
+     * retained. */
+    return h - (h >> 32);
+}
+
+unsigned long connector_key::hash() const
+{
+    return hash_fast32(k, sizeof k, 0);
+}
+#if 0
+//TODO
 //----------------------------------------------------------------------------------
 //      S57Obj CTOR
 //----------------------------------------------------------------------------------
 
 S57Obj::S57Obj()
 {
-    attList = NULL;
+    Init();
+}
+
+//----------------------------------------------------------------------------------
+//      S57Obj DTOR
+//----------------------------------------------------------------------------------
+
+S57Obj::~S57Obj()
+{
+    //  Don't delete any allocated records of simple copy clones
+    if( !bIsClone ) {
+        if( attVal ) {
+            for( unsigned int iv = 0; iv < attVal->GetCount(); iv++ ) {
+                S57attVal *vv = attVal->Item( iv );
+                void *v2 = vv->value;
+                free( v2 );
+                delete vv;
+            }
+            delete attVal;
+        }
+        free( att_array );
+
+        if( pPolyTessGeo ) {
+#ifdef ocpnUSE_GL
+            bool b_useVBO = g_b_EnableVBO  && !auxParm1;    // VBO allowed?
+
+            PolyTriGroup *ppg_vbo = pPolyTessGeo->Get_PolyTriGroup_head();
+            if (b_useVBO && ppg_vbo && auxParm0 > 0 && ppg_vbo->single_buffer && s_glDeleteBuffers) {
+                s_glDeleteBuffers(1, (GLuint *)&auxParm0);
+            }
+#endif
+            delete pPolyTessGeo;
+        }
+
+        if( pPolyTrapGeo ) delete pPolyTrapGeo;
+
+        if( FText ) delete FText;
+
+        if( geoPt ) free( geoPt );
+        if( geoPtz ) free( geoPtz );
+        if( geoPtMulti ) free( geoPtMulti );
+
+        if( m_lsindex_array ) free( m_lsindex_array );
+
+        if(m_ls_list){
+            line_segment_element *element = m_ls_list;
+            while(element){
+                line_segment_element *next = element->next;
+                delete element;
+                element = next;
+            }
+        }
+    }
+}
+
+
+void S57Obj::Init()
+{
+    att_array = NULL;
     attVal = NULL;
+    n_attr = 0;
 
     pPolyTessGeo = NULL;
     pPolyTrapGeo = NULL;
@@ -151,7 +286,10 @@ S57Obj::S57Obj()
     m_n_lsindex = 0;
     m_lsindex_array = NULL;
     m_n_edge_max_points = 0;
+    m_ls_list = 0;
+    m_ls_list_legacy = 0;
 
+    iOBJL = -1; // deferred, done by OBJL filtering in the PLIB as needed
     bBBObj_valid = false;
 
     //        Set default (unity) auxiliary transform coefficients
@@ -159,49 +297,234 @@ S57Obj::S57Obj()
     y_rate = 1.0;
     x_origin = 0.0;
     y_origin = 0.0;
+
+    auxParm0 = 0;
+    auxParm1 = 0;
+    auxParm2 = 0;
+    auxParm3 = 0;
 }
 
 //----------------------------------------------------------------------------------
-//      S57Obj DTOR
+//      S57Obj CTOR from FeatureName
 //----------------------------------------------------------------------------------
-
-S57Obj::~S57Obj()
+S57Obj::S57Obj( const char* featureName )
 {
-    //  Don't delete any allocated records of simple copy clones
-    if( !bIsClone ) {
-        if( attVal ) {
-            for( unsigned int iv = 0; iv < attVal->GetCount(); iv++ ) {
-                S57attVal *vv = attVal->Item( iv );
-                void *v2 = vv->value;
-                free( v2 );
-                delete vv;
-            }
-            delete attVal;
-        }
-        if( attList ) delete attList;
+    Init();
 
-        if( pPolyTessGeo ) delete pPolyTessGeo;
+    attVal = new wxArrayOfS57attVal();
 
-        if( pPolyTrapGeo ) delete pPolyTrapGeo;
+    strncpy( FeatureName, featureName, 6 );
+    FeatureName[6] = 0;
 
-        if( FText ) delete FText;
+    if( !strncmp( FeatureName, "DEPARE", 6 )
+        || !strncmp( FeatureName, "DRGARE", 6 ) ) bIsAssociable = true;
 
-        if( geoPt ) free( geoPt );
-        if( geoPtz ) free( geoPtz );
-        if( geoPtMulti ) free( geoPtMulti );
-
-        if( m_lsindex_array ) free( m_lsindex_array );
-    }
 }
+
+
+bool S57Obj::AddIntegerAttribute( const char *acronym, int val ){
+
+    S57attVal *pattValTmp = new S57attVal;
+
+    int *pAVI = (int *) malloc( sizeof(int) );         //new int;
+    *pAVI = val;
+
+    pattValTmp->valType = OGR_INT;
+    pattValTmp->value = pAVI;
+
+    att_array = (char *)realloc(att_array, 6*(n_attr + 1));
+    strncpy(att_array + (6 * sizeof(char) * n_attr), acronym, 6);
+    n_attr++;
+
+    attVal->Add( pattValTmp );
+
+    return true;
+}
+
+bool S57Obj::AddIntegerListAttribute( const char *acronym, int *pval, int nValue ){
+
+    return true;
+}
+
+bool S57Obj::AddDoubleAttribute( const char *acronym, double val ){
+
+    S57attVal *pattValTmp = new S57attVal;
+
+    double *pAVI = (double *) malloc( sizeof(double) );         //new double;
+    *pAVI = val;
+
+    pattValTmp->valType = OGR_REAL;
+    pattValTmp->value = pAVI;
+
+    att_array = (char *)realloc(att_array, 6*(n_attr + 1));
+    strncpy(att_array + (6 * sizeof(char) * n_attr), acronym, 6);
+    n_attr++;
+
+    attVal->Add( pattValTmp );
+
+    return true;
+}
+
+bool S57Obj::AddDoubleListAttribute( const char *acronym, double *pval, int nValue ){
+
+    return true;
+}
+
+bool S57Obj::AddStringAttribute( const char *acronym, char *val ){
+
+    S57attVal *pattValTmp = new S57attVal;
+
+    char *pAVS = (char *)malloc(strlen(val) + 1);   //new string
+    strcpy(pAVS, val);
+
+    pattValTmp->valType = OGR_STR;
+    pattValTmp->value = pAVS;
+
+    att_array = (char *)realloc(att_array, 6*(n_attr + 1));
+    strncpy(att_array + (6 * sizeof(char) * n_attr), acronym, 6);
+    n_attr++;
+
+    attVal->Add( pattValTmp );
+
+    return true;
+}
+
+bool S57Obj::SetPointGeometry( double lat, double lon, double ref_lat, double ref_lon)
+{
+    Primitive_type = GEO_POINT;
+
+    m_lon = lon;
+    m_lat = lat;
+
+    //  Set initial BoundingBox limits fairly large...
+    BBObj.Set(m_lat - .25, m_lon - .25, m_lat + .25, m_lon + .25);
+    bBBObj_valid = false;
+
+    //  Calculate SM from chart common reference point
+    double easting, northing;
+    toSM( lat, lon, ref_lat, ref_lon, &easting, &northing );
+
+    x = easting;
+    y = northing;
+
+    npt = 1;
+
+    return true;
+}
+
+
+bool S57Obj::SetLineGeometry( LineGeometryDescriptor *pGeo, GeoPrim_t geoType, double ref_lat, double ref_lon)
+{
+    Primitive_type = geoType;
+
+    // set s57obj bbox as lat/lon
+    BBObj.Set(pGeo->extent_s_lat, pGeo->extent_w_lon, pGeo->extent_n_lat, pGeo->extent_e_lon);
+    bBBObj_valid = true;
+
+    //  and declare x/y of the object to be average east/north of all points
+    double e1, e2, n1, n2;
+    toSM( pGeo->extent_n_lat, pGeo->extent_e_lon, ref_lat, ref_lon, &e1, &n1 );
+    toSM( pGeo->extent_s_lat, pGeo->extent_w_lon, ref_lat, ref_lon, &e2, &n2 );
+
+    x = ( e1 + e2 ) / 2.;
+    y = ( n1 + n2 ) / 2.;
+
+    //  Set the object base point
+    double xll, yll;
+    fromSM( x, y, ref_lat, ref_lon, &yll, &xll );
+    m_lon = xll;
+    m_lat = yll;
+
+    //  Set the edge and connected node table indices
+    m_n_lsindex = pGeo->indexCount;
+    m_lsindex_array = pGeo->indexTable;
+
+    m_n_edge_max_points = 0; //TODO this could be precalulated and added to next SENC format
+
+    return true;
+}
+
+
+bool S57Obj::SetAreaGeometry( PolyTessGeo *ppg, double ref_lat, double ref_lon)
+{
+    Primitive_type = GEO_AREA;
+    pPolyTessGeo = ppg;
+
+    //  Set the s57obj bounding box as lat/lon
+    BBObj.Set(ppg->Get_ymin(), ppg->Get_xmin(), ppg->Get_ymax(), ppg->Get_xmax());
+    bBBObj_valid = true;
+
+    //  and declare x/y of the object to be average east/north of all points
+    double e1, e2, n1, n2;
+    toSM( ppg->Get_ymax(), ppg->Get_xmax(), ref_lat, ref_lon, &e1,&n1 );
+    toSM( ppg->Get_ymin(), ppg->Get_xmin(), ref_lat, ref_lon, &e2,&n2 );
+
+    x = ( e1 + e2 ) / 2.;
+    y = ( n1 + n2 ) / 2.;
+
+    //  Set the object base point
+    double xll, yll;
+    fromSM( x, y, ref_lat, ref_lon, &yll, &xll );
+    m_lon = xll;
+    m_lat = yll;
+
+
+    return true;
+}
+
+bool S57Obj::SetMultipointGeometry( MultipointGeometryDescriptor *pGeo, double ref_lat, double ref_lon)
+{
+    Primitive_type = GEO_POINT;
+
+    npt = pGeo->pointCount;
+
+    geoPtz = (double *) malloc( npt * 3 * sizeof(double) );
+    geoPtMulti = (double *) malloc( npt * 2 * sizeof(double) );
+
+    double *pdd = geoPtz;
+    double *pdl = geoPtMulti;
+
+    float *pfs = (float *) ( pGeo->pointTable);                 // start of point data
+    for( int ip = 0; ip < npt; ip++ ) {
+        float easting, northing;
+        easting = *pfs++;
+        northing = *pfs++;
+        float depth = *pfs++;
+
+        *pdd++ = easting;
+        *pdd++ = northing;
+        *pdd++ = depth;
+
+        //  Convert point from SM to lat/lon for later use in decomposed bboxes
+        double xll, yll;
+        fromSM( easting, northing, ref_lat, ref_lon, &yll, &xll );
+
+        *pdl++ = xll;
+        *pdl++ = yll;
+    }
+
+    // set s57obj bbox as lat/lon
+    BBObj.Set(pGeo->extent_s_lat, pGeo->extent_w_lon, pGeo->extent_n_lat, pGeo->extent_e_lon);
+    bBBObj_valid = true;
+
+    return true;
+}
+
 
 //----------------------------------------------------------------------------------
 //      S57Obj CTOR from SENC file
 //----------------------------------------------------------------------------------
 
-S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dummy2 )
+S57Obj::S57Obj( char *buf, int size, wxInputStream *pfpx, double dummy, double dummy2, int senc_file_version )
 {
-    attList = NULL;
+    att_array = NULL;
     attVal = NULL;
+    n_attr = 0;
+    auxParm0 = 0;
+    auxParm1 = 0;
+    auxParm2 = 0;
+    auxParm3 = 0;
+
     pPolyTessGeo = NULL;
     pPolyTrapGeo = NULL;
     bCS_Added = 0;
@@ -216,8 +539,10 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
     Scamin = 10000000;                              // ten million enough?
     nRef = 0;
     bIsAton = false;
+    bIsAssociable = false;
     m_n_lsindex = 0;
     m_lsindex_array = NULL;
+    m_ls_list = 0;
 
     //        Set default (unity) auxiliary transform coefficients
     x_rate = 1.0;
@@ -225,15 +550,12 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
     x_origin = 0.0;
     y_origin = 0.0;
 
-    if( strlen( first_line ) == 0 ) return;
+    if( strlen( buf ) == 0 ) return;
 
     int FEIndex;
 
-    int MAX_LINE = 499999;
-    char *buf = (char *) malloc( MAX_LINE + 1 );
+    int MAX_LINE = size;
     int llmax = 0;
-
-    char szFeatureName[20];
 
     char *br;
     char szAtt[20];
@@ -243,20 +565,16 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
 
     char *hdr_buf = (char *) malloc( 1 );
 
-    strcpy( buf, first_line );
-
 //    while(!dun)
     {
 
         if( !strncmp( buf, "OGRF", 4 ) ) {
-            attList = new wxString();
             attVal = new wxArrayOfS57attVal();
 
             FEIndex = atoi( buf + 19 );
 
-            strncpy( szFeatureName, buf + 11, 6 );
-            szFeatureName[6] = 0;
-            strcpy( FeatureName, szFeatureName );
+            strncpy( FeatureName, buf + 11, 6 );
+            FeatureName[6] = 0;
 
             //      Build/Maintain a list of found OBJL types for later use
             //      And back-reference the appropriate list index in S57Obj for Display Filtering
@@ -289,10 +607,19 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
 
                 if( !strncmp( buf, "HDRLEN", 6 ) ) {
                     hdr_len = atoi( buf + 7 );
+		    char * tmp = hdr_buf;
                     hdr_buf = (char *) realloc( hdr_buf, hdr_len );
-                    pfpx->Read( hdr_buf, hdr_len );
-                    mybuf_ptr = hdr_buf;
-                    hdr_end = hdr_buf + hdr_len;
+                    if (NULL == hdr_buf)
+                    {
+                        free ( tmp );
+                        tmp = NULL;
+                    }
+                    else
+                    {
+                        pfpx->Read( hdr_buf, hdr_len );
+                        mybuf_ptr = hdr_buf;
+                        hdr_end = hdr_buf + hdr_len;
+                    }
                 }
 
                 else if( !strncmp( buf, geoMatch, 6 ) ) {
@@ -338,8 +665,10 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
                 bool iua = IsUsefulAttribute( buf );
 
                 szAtt[0] = 0;
-
-                if( iua ) {
+                char t = buf[10];
+                // there's enough other types, testing first is faster
+                // than new/delete
+                if( iua && (t == 'I' || t == 'S' || t == 'R')) {
                     S57attVal *pattValTmp = new S57attVal;
 
                     if( buf[10] == 'I' ) {
@@ -416,8 +745,11 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
                     }
 
                     if( strlen( szAtt ) ) {
-                        attList->Append( wxString( szAtt, wxConvUTF8 ) );
-                        attList->Append( '\037' );
+                        wxASSERT( strlen(szAtt) == 6);
+                        att_array = (char *)realloc(att_array, 6*(n_attr + 1));
+
+                        strncpy(att_array + (6 * sizeof(char) * n_attr), szAtt, 6);
+                        n_attr++;
 
                         attVal->Add( pattValTmp );
                     } else
@@ -427,6 +759,7 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
             }               // while attdun
 
             //              Develop Geometry
+
 
             switch( prim ){
                 case 1: {
@@ -439,15 +772,17 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
 
                         my_fgets( buf, MAX_LINE, *pfpx );
                         int wkb_len = atoi( buf + 2 );
-                        pfpx->Read( buf, wkb_len );
-
-                        npt = 1;
-                        float *pfs = (float *) ( buf + 5 );                // point to the point
+                        // ARM need 32 bits alignment, may be faster on some x86 too
+                        unsigned int align = 3;
+                        pfpx->Read( buf +align, wkb_len );
 
                         float easting, northing;
+                        npt = 1;
+
+                        float *pfs = (float *) ( buf + 5 +align );     // point to the point
+
                         easting = *pfs++;
                         northing = *pfs;
-
                         x = easting;                                    // and save as SM
                         y = northing;
 
@@ -457,9 +792,10 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
 
                         m_lon = xll;
                         m_lat = yll;
-                        BBObj.SetMin( m_lon - .25, m_lat - .25 );
-                        BBObj.SetMax( m_lon + .25, m_lat + .25 );
 
+                        BBObj.Set( m_lat - .25, m_lon - .25,
+                                   m_lat + .25, m_lon + .25 );
+                        BBObj.Invalidate();
                     } else {
                         Primitive_type = GEO_POINT;
 
@@ -469,9 +805,11 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
 
                         my_fgets( buf, MAX_LINE, *pfpx );
                         int wkb_len = atoi( buf + 2 );
-                        pfpx->Read( buf, wkb_len );
+                        // ARM need 32 bits alignment, may be faster on some x86 too
+                        unsigned int align = 3;
+                        pfpx->Read( buf +align, wkb_len );
 
-                        npt = *( (int *) ( buf + 5 ) );
+                        npt = *( (int *) ( buf + 5 +align) );
 
                         geoPtz = (double *) malloc( npt * 3 * sizeof(double) );
                         geoPtMulti = (double *) malloc( npt * 2 * sizeof(double) );
@@ -479,7 +817,7 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
                         double *pdd = geoPtz;
                         double *pdl = geoPtMulti;
 
-                        float *pfs = (float *) ( buf + 9 );                 // start of data
+                        float *pfs = (float *) ( buf + 9 +align);                 // start of data
                         for( int ip = 0; ip < npt; ip++ ) {
                             float easting, northing;
                             easting = *pfs++;
@@ -497,16 +835,13 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
                             *pdl++ = xll;
                             *pdl++ = yll;
                         }
-
                         // Capture bbox limits recorded in SENC record as lon/lat
                         float xmax = *pfs++;
                         float xmin = *pfs++;
                         float ymax = *pfs++;
                         float ymin = *pfs;
 
-                        BBObj.SetMin( xmin, ymin );
-                        BBObj.SetMax( xmax, ymax );
-
+                        BBObj.Set( ymin, xmin, ymax, xmax );
                     }
                     break;
                 }
@@ -523,15 +858,23 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
 
                         my_fgets( buf, MAX_LINE, *pfpx );
                         int sb_len = atoi( buf + 2 );
+                        unsigned char *buft;
+                        // ARM need 32 bits alignment, may be faster on some x86 too
+                        int align = 3;
+                        if (sb_len > MAX_LINE + align)
+                            buft = (unsigned char *) malloc( sb_len +align);
+                        else
+                            buft = (unsigned char *) buf;
 
-                        unsigned char *buft = (unsigned char *) malloc( sb_len );
-                        pfpx->Read( buft, sb_len );
+                        pfpx->Read( buft +align, sb_len );
 
-                        npt = *( (int *) ( buft + 5 ) );
+                        npt = *( (int *) ( buft + 5 +align) );
 
                         geoPt = (pt*) malloc( ( npt ) * sizeof(pt) );
                         pt *ppt = geoPt;
-                        float *pf = (float *) ( buft + 9 );
+                        float *pf = (float *) ( buft + 9 +align);
+                        float xmax, xmin, ymax, ymin;
+
 
                         // Capture SM points
                         for( int ip = 0; ip < npt; ip++ ) {
@@ -541,17 +884,16 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
                         }
 
                         // Capture bbox limits recorded as lon/lat
-                        float xmax = *pf++;
-                        float xmin = *pf++;
-                        float ymax = *pf++;
-                        float ymin = *pf;
+                        xmax = *pf++;
+                        xmin = *pf++;
+                        ymax = *pf++;
+                        ymin = *pf;
 
-                        free( buft );
+                        if (sb_len > MAX_LINE +align)
+                            free( buft );
 
                         // set s57obj bbox as lat/lon
-                        BBObj.SetMin( xmin, ymin );
-                        BBObj.SetMax( xmax, ymax );
-                        bBBObj_valid = true;
+                        BBObj.Set( ymin, xmin, ymax, xmax );
 
                         //  and declare x/y of the object to be average east/north of all points
                         double e1, e2, n1, n2;
@@ -609,18 +951,23 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
                         sscanf( buf, " %s %d %f %f", tbuf, &nrecl, &area_ref_lat, &area_ref_lon );
 
                         if( nrecl ) {
-                            unsigned char *polybuf = (unsigned char *) malloc( nrecl + 1 );
+                            unsigned char *polybuf;
+                            if (nrecl > MAX_LINE)
+                                polybuf = (unsigned char *) malloc( nrecl + 1 );
+                            else
+                                polybuf = (unsigned char *)buf;
+
                             pfpx->Read( polybuf, nrecl );
                             polybuf[nrecl] = 0;                     // endit
-                            PolyTessGeo *ppg = new PolyTessGeo( polybuf, nrecl, FEIndex );
-                            free( polybuf );
+                            PolyTessGeo *ppg = new PolyTessGeo( polybuf, nrecl, FEIndex, senc_file_version );
+                            if (nrecl > MAX_LINE)
+                                free( polybuf );
 
                             pPolyTessGeo = ppg;
 
                             //  Set the s57obj bounding box as lat/lon
-                            BBObj.SetMin( ppg->Get_xmin(), ppg->Get_ymin() );
-                            BBObj.SetMax( ppg->Get_xmax(), ppg->Get_ymax() );
-                            bBBObj_valid = true;
+                            BBObj.Set( ppg->Get_ymin(), ppg->Get_xmin(),
+                                       ppg->Get_ymax(), ppg->Get_xmax() );
 
                             //  and declare x/y of the object to be average east/north of all points
                             double e1, e2, n1, n2;
@@ -652,6 +999,9 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
 
                         }
                     }
+                    else {                      // not "POLYTESSGEO"
+                        pfpx->Ungetch(buf, strlen(buf) );
+                    }
 
                     break;
                 }
@@ -663,7 +1013,6 @@ S57Obj::S57Obj( char *first_line, wxInputStream *pfpx, double dummy, double dumm
         }               //OGRF
     }                       //while(!dun)
 
-    free( buf );
     free( hdr_buf );
 
 }
@@ -819,60 +1168,59 @@ int S57Obj::my_bufgetl( char *ib_read, char *ib_end, char *buf, int buf_len_max 
     return nLineLen;
 }
 
-wxString S57Obj::GetAttrValueAsString( char *AttrName )
+int S57Obj::GetAttributeIndex( const char *AttrSeek ) {
+    char *patl = att_array;
+
+    for(int i=0 ; i < n_attr ; i++) {
+        if(!strncmp(patl, AttrSeek, 6)){
+            return i;
+            break;
+        }
+
+        patl += 6;
+    }
+
+    return -1;
+}
+
+
+wxString S57Obj::GetAttrValueAsString( const char *AttrName )
 {
     wxString str;
-    char *tattList = (char *) calloc( attList->Len() + 1, 1 );
-    strncpy( tattList, attList->mb_str(), attList->Len() );
 
-    char *patl = tattList;
-    char *patr;
-    int idx = 0;
-    while( *patl ) {
-        patr = patl;
-        while( *patr != '\037' )
-            patr++;
+    int idx = GetAttributeIndex(AttrName);
 
-        if( !strncmp( patl, AttrName, 6 ) ) break;
-
-        patl = patr + 1;
-        idx++;
-    }
-
-    if( !*patl ) {
-        free( tattList );
-        return str;
-    }
+    if(idx >= 0) {
 
 //      using idx to get the attribute value
 
-    S57attVal *v = attVal->Item( idx );
+        S57attVal *v = attVal->Item( idx );
 
-    switch( v->valType ){
-        case OGR_STR: {
-            char *val = (char *) ( v->value );
-            str.Append( wxString( val, wxConvUTF8 ) );
-            break;
-        }
-        case OGR_REAL: {
-            double dval = *(double*) ( v->value );
-            str.Printf( _T("%g"), dval );
-            break;
-        }
-        case OGR_INT: {
-            int ival = *( (int *) v->value );
-            str.Printf( _T("%d"), ival );
-            break;
-        }
-        default: {
-            str.Printf( _T("Unknown attribute type") );
-            break;
+        switch( v->valType ){
+            case OGR_STR: {
+                char *val = (char *) ( v->value );
+                str.Append( wxString( val, wxConvUTF8 ) );
+                break;
+            }
+            case OGR_REAL: {
+                double dval = *(double*) ( v->value );
+                str.Printf( _T("%g"), dval );
+                break;
+            }
+            case OGR_INT: {
+                int ival = *( (int *) v->value );
+                str.Printf( _T("%d"), ival );
+                break;
+            }
+            default: {
+                str.Printf( _T("Unknown attribute type") );
+                break;
+            }
         }
     }
-
-    free( tattList );
     return str;
 }
+#endif
 
 //----------------------------------------------------------------------------------
 //      render_canvas_parms Implementation
@@ -883,48 +1231,6 @@ render_canvas_parms::render_canvas_parms()
     pix_buff = NULL;
 }
 
-render_canvas_parms::render_canvas_parms( int xr, int yr, int widthr, int heightr, wxColour color )
-{
-    depth = BPP;
-    pb_pitch = ( widthr * depth / 8 );
-    lclip = x;
-    rclip = x + widthr - 1;
-    pix_buff = (unsigned char *) malloc( heightr * pb_pitch );
-    width = widthr;
-    height = heightr;
-    x = xr;
-    y = yr;
-
-    unsigned char r, g, b;
-    if( color.IsOk() ) {
-        r = color.Red();
-        g = color.Green();
-        b = color.Blue();
-    } else
-        r = g = b = 0;
-
-    if( depth == 24 ) {
-        for( int i = 0; i < height; i++ ) {
-            unsigned char *p = pix_buff + ( i * pb_pitch );
-            for( int j = 0; j < width; j++ ) {
-                *p++ = r;
-                *p++ = g;
-                *p++ = b;
-            }
-        }
-    } else {
-        for( int i = 0; i < height; i++ ) {
-            unsigned char *p = pix_buff + ( i * pb_pitch );
-            for( int j = 0; j < width; j++ ) {
-                *p++ = r;
-                *p++ = g;
-                *p++ = b;
-                *p++ = 0;
-            }
-        }
-    }
-
-}
 
 render_canvas_parms::~render_canvas_parms( void )
 {
@@ -955,7 +1261,6 @@ s57chart::s57chart()
     pRigidATONArray = new wxArrayPtrVoid;
 
     m_tmpup_array = NULL;
-    m_pcsv_locn = new wxString( g_csv_locn );
 
     m_DepthUnits = _T("METERS");
     m_depth_unit_id = DEPTH_UNIT_METERS;
@@ -976,14 +1281,22 @@ s57chart::s57chart()
     m_bbase_file_attr_known = false;
 
     m_bLinePrioritySet = false;
-    if( ps52plib ) m_plib_state_hash = ps52plib->GetStateHash();
-    else
-        m_plib_state_hash = 0;
+    m_plib_state_hash = 0;
 
     m_btex_mem = false;
 
     ref_lat = 0.0;
     ref_lon = 0.0;
+
+    m_b2pointLUPS = false;
+    m_b2lineLUPS = false;
+
+    m_next_safe_cnt = 1e6;
+    m_LineVBO_name = -1;
+    m_line_vertex_buffer = 0;
+    m_this_chart_context =  0;
+    m_Chart_Skew = 0;
+
 }
 
 s57chart::~s57chart()
@@ -999,37 +1312,68 @@ s57chart::~s57chart()
     delete pFloatingATONArray;
     delete pRigidATONArray;
 
-    delete m_pcsv_locn;
-
     delete m_pENCDS;
 
     free( m_pvaldco_array );
 
+    free( m_line_vertex_buffer );
+
     delete m_pDIBThumbOrphan;
 
+    for (unsigned i=0; i<m_pcs_vector.size(); i++)
+        delete m_pcs_vector.at(i);
+ 
+    for (unsigned i=0; i<m_pve_vector.size(); i++)
+        delete m_pve_vector.at(i);
+    
+    m_pcs_vector.clear();
+    m_pve_vector.clear();
+    
+#if 0 //TODO
     VE_Hash::iterator it;
-    for( it = m_ve_hash.begin(); it != m_ve_hash.end(); ++it ) {
+    for( it = old_m_ve_hash.begin(); it != old_m_ve_hash.end(); ++it ) {
         VE_Element *value = it->second;
         if( value ) {
             free( value->pPoints );
             delete value;
         }
     }
-    m_ve_hash.clear();
+    old_m_ve_hash.clear();
+
+    connected_segment_hash::iterator itcsc;
+    for( itcsc = old_m_connector_hash.begin(); itcsc != old_m_connector_hash.end(); ++itcsc ) {
+        connector_segment *value = itcsc->second;
+        if( value ) {
+            delete value;
+        }
+    }
+    old_m_connector_hash.clear();
 
     VC_Hash::iterator itc;
-    for( itc = m_vc_hash.begin(); itc != m_vc_hash.end(); ++itc ) {
+    for( itc = old_m_vc_hash.begin(); itc != old_m_vc_hash.end(); ++itc ) {
         VC_Element *value = itc->second;
         if( value ) {
             free( value->pPoint );
             delete value;
         }
     }
-    m_vc_hash.clear();
+    old_m_vc_hash.clear();
 
+#endif
+
+#ifdef ocpnUSE_GL
+    if(s_glDeleteBuffers && (m_LineVBO_name > 0))
+        s_glDeleteBuffers(1, (GLuint *)&m_LineVBO_name);
+#endif
+    free (m_this_chart_context);    
+
+    if(m_TempFilePath.Length() && (m_FullPath != m_TempFilePath)){
+        if( ::wxFileExists(m_TempFilePath) )
+            wxRemoveFile(m_TempFilePath);
+    }
 }
 
-void s57chart::GetValidCanvasRegion( const ViewPort& VPoint, wxRegion *pValidRegion )
+void s57chart::GetValidCanvasRegion( const ViewPort& VPoint, OCPNRegion *pValidRegion )
 {
     int rxl, rxr;
     int ryb, ryt;
@@ -1052,6 +1396,15 @@ void s57chart::GetValidCanvasRegion( const ViewPort& VPoint, wxRegion *pValidReg
 
     pValidRegion->Clear();
     pValidRegion->Union( rxl, ryt, rxr - rxl, ryb - ryt );
+}
+
+LLRegion s57chart::GetValidRegion()
+{
+    double ll[8] = {m_FullExtent.SLAT, m_FullExtent.WLON,
+                    m_FullExtent.SLAT, m_FullExtent.ELON,
+                    m_FullExtent.NLAT, m_FullExtent.ELON,
+                    m_FullExtent.NLAT, m_FullExtent.WLON};
+    return LLRegion(4, ll);
 }
 
 void s57chart::SetColorScheme( ColorScheme cs, bool bApplyImmediate )
@@ -1145,7 +1498,8 @@ void s57chart::FreeObjectsAndRules()
             top = razRules[i][j];
             while( top != NULL ) {
                 top->obj->nRef--;
-                if( 0 == top->obj->nRef ) delete top->obj;
+                if( 0 == top->obj->nRef )
+                    delete top->obj;
 
                 if( top->child ) {
                     ObjRazRules *ctop = top->child;
@@ -1161,7 +1515,18 @@ void s57chart::FreeObjectsAndRules()
                     }
                 }
 
-                nxx = top->next;
+                if( top->mps ){
+                    if( ps52plib && top->mps->cs_rules ){
+                        for(unsigned int i=0 ; i < top->mps->cs_rules->GetCount() ; i++){
+                            Rules *rule_chain_top = top->mps->cs_rules->Item(i);
+                            ps52plib->DestroyRulesChain( rule_chain_top );
+                        }
+                        delete top->mps->cs_rules;
+                    }
+                    free( top->mps );
+                }
+
+                 nxx = top->next;
                 free( top );
                 top = nxx;
             }
@@ -1202,21 +1567,15 @@ void s57chart::ClearRenderedTextCache()
 
 double s57chart::GetNormalScaleMin( double canvas_scale_factor, bool b_allow_overzoom )
 {
-    double ppm = canvas_scale_factor / m_Chart_Scale; // true_chart_scale_on_display   = m_canvas_scale_factor / pixels_per_meter of displayed chart
-
-    //Adjust overzoom factor based on  b_allow_overzoom option setting
-    double oz_factor;
-    if( b_allow_overzoom ) oz_factor = 256.;
-    else
-        oz_factor = 4.;
-
-    ppm *= oz_factor;
-
-    return canvas_scale_factor / ppm;
+//    if( b_allow_overzoom )
+        return m_Chart_Scale * 0.125;
+//    else
+//        return m_Chart_Scale * 0.25;
 }
 double s57chart::GetNormalScaleMax( double canvas_scale_factor, int canvas_width )
 {
-    return 1.0e7;
+    return m_Chart_Scale * 4.0;
+
 }
 
 //-----------------------------------------------------------------------
@@ -1225,22 +1584,23 @@ double s57chart::GetNormalScaleMax( double canvas_scale_factor, int canvas_width
 
 void s57chart::GetPointPix( ObjRazRules *rzRules, float north, float east, wxPoint *r )
 {
-    r->x = (int) round(((east - m_easting_vp_center) * m_view_scale_ppm) + m_pixx_vp_center);
-    r->y = (int) round(m_pixy_vp_center - ((north - m_northing_vp_center) * m_view_scale_ppm));
+    r->x = roundint(((east - m_easting_vp_center) * m_view_scale_ppm) + m_pixx_vp_center);
+    r->y = roundint(m_pixy_vp_center - ((north - m_northing_vp_center) * m_view_scale_ppm));
 }
 
 void s57chart::GetPointPix( ObjRazRules *rzRules, wxPoint2DDouble *en, wxPoint *r, int nPoints )
 {
     for( int i = 0; i < nPoints; i++ ) {
-        r[i].x =
-                (int) round(((en[i].m_x - m_easting_vp_center) * m_view_scale_ppm) + m_pixx_vp_center);
-        r[i].y =
-                (int) round(m_pixy_vp_center - ((en[i].m_y - m_northing_vp_center) * m_view_scale_ppm));
+        r[i].x =  roundint(((en[i].m_x - m_easting_vp_center) * m_view_scale_ppm) + m_pixx_vp_center);
+        r[i].y =  roundint(m_pixy_vp_center - ((en[i].m_y - m_northing_vp_center) * m_view_scale_ppm));
     }
 }
 
 void s57chart::GetPixPoint( int pixx, int pixy, double *plat, double *plon, ViewPort *vpt )
 {
+    if(vpt->m_projection_type != PROJECTION_MERCATOR)
+        printf("s57chart unhandled projection\n");
+
     //    Use Mercator estimator
     int dx = pixx - ( vpt->pix_width / 2 );
     int dy = ( vpt->pix_height / 2 ) - pixy;
@@ -1266,11 +1626,14 @@ void s57chart::GetPixPoint( int pixx, int pixy, double *plat, double *plon, View
 void s57chart::SetVPParms( const ViewPort &vpt )
 {
     //  Set up local SM rendering constants
-    m_pixx_vp_center = vpt.pix_width / 2;
-    m_pixy_vp_center = vpt.pix_height / 2;
+    m_pixx_vp_center = vpt.pix_width / 2.0;
+    m_pixy_vp_center = vpt.pix_height / 2.0;
     m_view_scale_ppm = vpt.view_scale_ppm;
 
     toSM( vpt.clat, vpt.clon, ref_lat, ref_lon, &m_easting_vp_center, &m_northing_vp_center );
+
+    vp_transform.easting_vp_center = m_easting_vp_center;
+    vp_transform.northing_vp_center = m_northing_vp_center;
 }
 
 bool s57chart::AdjustVP( ViewPort &vp_last, ViewPort &vp_proposed )
@@ -1428,7 +1791,8 @@ void s57chart::SetLinePriorities( void )
 
             //    In the interest of speed, choose only the one necessary area boundary style index
             int j;
-            if( ps52plib->m_nBoundaryStyle == SYMBOLIZED_BOUNDARIES ) j = 4;
+            if( ps52plib->m_nBoundaryStyle == SYMBOLIZED_BOUNDARIES )
+                j = 4;
             else
                 j = 3;
 
@@ -1440,6 +1804,42 @@ void s57chart::SetLinePriorities( void )
             }
 
         }
+
+
+        // Traverse the entire object list again, setting the priority of each line_segment_element
+        // to the maximum priority seen for that segment
+        for( int i = 0; i < PRIO_NUM; ++i ) {
+            for( int j = 0; j < LUPNAME_NUM; j++ ) {
+                ObjRazRules *top = razRules[i][j];
+                while( top != NULL ) {
+                    S57Obj *obj = top->obj;
+
+                    VE_Element *pedge;
+                    connector_segment *pcs;
+                    line_segment_element *list = obj->m_ls_list;
+                    while( list ){
+                        switch (list->ls_type){
+                            case TYPE_EE:
+
+                                pedge = list->pedge;// (VE_Element *)list->private0;
+                                if(pedge)
+                                    list->priority = pedge->max_priority;
+                                break;
+
+                            default:
+                                pcs = list->pcs; //(connector_segment *)list->private0;
+                                if(pcs)
+                                    list->priority = pcs->max_priority_cs;
+                                break;
+                        }
+
+                        list = list->next;
+                    }
+
+                    top = top->next;
+                }
+            }
+        }
     }
 
     //      Mark the priority as set.
@@ -1447,21 +1847,1073 @@ void s57chart::SetLinePriorities( void )
     m_bLinePrioritySet = true;
 }
 
-bool s57chart::RenderRegionViewOnGL( const wxGLContext &glc, const ViewPort& VPoint,
-        const wxRegion &Region )
+#if 0
+void s57chart::SetLinePriorities( void )
 {
-    return DoRenderRegionViewOnGL( glc, VPoint, Region, false );
+    if( !ps52plib ) return;
+
+    //      If necessary.....
+    //      Establish line feature rendering priorities
+
+    if( !m_bLinePrioritySet ) {
+        ObjRazRules *top;
+        ObjRazRules *crnt;
+
+        for( int i = 0; i < PRIO_NUM; ++i ) {
+
+            top = razRules[i][2];           //LINES
+            while( top != NULL ) {
+                ObjRazRules *crnt = top;
+                top = top->next;
+                ps52plib->SetLineFeaturePriority( crnt, i );
+            }
+
+            //    In the interest of speed, choose only the one necessary area boundary style index
+            int j;
+            if( ps52plib->m_nBoundaryStyle == SYMBOLIZED_BOUNDARIES )
+                j = 4;
+            else
+                j = 3;
+
+            top = razRules[i][j];
+            while( top != NULL ) {
+                crnt = top;
+                top = top->next;               // next object
+                ps52plib->SetLineFeaturePriority( crnt, i );
+            }
+
+        }
+
+
+        // Traverse the entire object list again, setting the priority of each line_segment_element
+        // to the maximum priority seen for that segment
+        for( int i = 0; i < PRIO_NUM; ++i ) {
+            for( int j = 0; j < LUPNAME_NUM; j++ ) {
+                ObjRazRules *top = razRules[i][j];
+                while( top != NULL ) {
+                    S57Obj *obj = top->obj;
+
+                    VE_Element *pedge;
+                    connector_segment *pcs;
+                    line_segment_element *list = obj->m_ls_list;
+                    while( list ){
+                        switch (list->type){
+                            case TYPE_EE:
+
+                                pedge = (VE_Element *)list->private0;
+                                if(pedge)
+                                    list->priority = pedge->max_priority;
+                                break;
+
+                            default:
+                                pcs = (connector_segment *)list->private0;
+                                if(pcs)
+                                    list->priority = pcs->max_priority;
+                                break;
+                        }
+
+                        list = list->next;
+                    }
+
+                    top = top->next;
+                }
+            }
+        }
+    }
+
+    //      Mark the priority as set.
+    //      Generally only reset by Options Dialog post processing
+    m_bLinePrioritySet = true;
+}
+#endif
+
+int s57chart::GetLineFeaturePointArray(S57Obj *obj, void **ret_array)
+{
+    //  Walk the line segment list once to get the required array size
+
+    int nPoints = 0;
+    line_segment_element *ls_list = obj->m_ls_list;
+    while( ls_list){
+        if(ls_list->ls_type == TYPE_EE)
+            nPoints += ls_list->pedge->nCount;
+        else
+            nPoints += 2;
+        ls_list = ls_list->next;
+    }
+
+    if(!nPoints){
+        *ret_array = 0;
+        return 0;
+    }
+
+    //  Allocate the buffer
+    float *br = (float *)malloc(nPoints * 2 * sizeof(float));
+    *ret_array = br;
+
+    // populate the buffer
+    unsigned char *source_buffer = (unsigned char *)GetLineVertexBuffer();
+    ls_list = obj->m_ls_list;
+    while( ls_list){
+        size_t vbo_offset = 0;
+        size_t count = 0;
+        if(ls_list->ls_type == TYPE_EE){
+            vbo_offset = ls_list->pedge->vbo_offset;
+            count = ls_list->pedge->nCount;
+        }
+        else{
+            vbo_offset = ls_list->pcs->vbo_offset;
+            count = 2;
+        }
+
+        memcpy(br, source_buffer + vbo_offset, count * 2 * sizeof(float));
+        br += count * 2;
+        ls_list = ls_list->next;
+    }
+
+    return nPoints;
+
+}
+
+
+#if 0
+int s57chart::GetLineFeaturePointArray(S57Obj *obj, void **ret_array)
+{
+    //  Walk the line segment list once to get the required array size
+
+    int nPoints = 0;
+    line_segment_element *ls_list = obj->m_ls_list;
+    while( ls_list){
+        nPoints += ls_list->n_points;
+        ls_list = ls_list->next;
+    }
+
+    if(!nPoints){
+        *ret_array = 0;
+        return 0;
+    }
+
+    //  Allocate the buffer
+    float *br = (float *)malloc(nPoints * 2 * sizeof(float));
+    *ret_array = br;
+
+    // populate the buffer
+    unsigned char *source_buffer = (unsigned char *)GetLineVertexBuffer();
+    ls_list = obj->m_ls_list;
+    while( ls_list){
+        memcpy(br, source_buffer + ls_list->vbo_offset, ls_list->n_points * 2 * sizeof(float));
+        br += ls_list->n_points * 2;
+        ls_list = ls_list->next;
+    }
+
+    return nPoints;
+
+}
+#endif
+
+void s57chart::AssembleLineGeometry( void )
+{
+    // Walk the hash tables to get the required buffer size
+
+    //  Start with the edge hash table
+    size_t nPoints = 0;
+    VE_Hash::iterator it;
+    for( it = m_ve_hash.begin(); it != m_ve_hash.end(); ++it ) {
+        VE_Element *pedge = it->second;
+        if( pedge ) {
+            nPoints += pedge->nCount;
+        }
+    }
+
+    //    printf("time0 %f\n", sw.GetTime());
+
+
+
+    std::unordered_map<std::string, connector_segment *> ce_connector_hash;
+    std::unordered_map<std::string, connector_segment *> ec_connector_hash;
+    std::unordered_map<std::string, connector_segment *> cc_connector_hash;
+
+    int ndelta = 0;
+
+    //  Define a vector to temporarily hold the geometry for the created pcs elements
+
+    typedef struct segment_pair{
+        float e0, n0, e1, n1;
+    }_segment_pair;
+
+    std::vector<segment_pair> connector_segment_vector;
+    size_t seg_pair_index = 0;
+
+
+
+    //  Get the end node connected segments.  To do this, we
+    //  walk the Feature array and process each feature that potentially has a LINE type element
+    for( int i = 0; i < PRIO_NUM; ++i ) {
+        for( int j = 0; j < LUPNAME_NUM; j++ ) {
+            ObjRazRules *top = razRules[i][j];
+            while( top != NULL ) {
+                S57Obj *obj = top->obj;
+
+                line_segment_element list_top;
+                list_top.next = 0;
+
+                line_segment_element *le_current = &list_top;
+
+                for( int iseg = 0; iseg < obj->m_n_lsindex; iseg++ ) {
+
+                    if(!obj->m_lsindex_array)
+                        continue;
+
+                    int seg_index = iseg * 3;
+                    int *index_run = &obj->m_lsindex_array[seg_index];
+
+                    //  Get first connected node
+                    unsigned int inode = *index_run++;
+
+                    //  Get the edge
+                    bool edge_dir = true;
+                    int venode = *index_run++;
+                    if(venode < 0){
+                        venode = -venode;
+                        edge_dir = false;
+                    }
+
+                    VE_Element *pedge = 0;
+                    if(venode){
+                        if(m_ve_hash.find(venode) != m_ve_hash.end())
+                            pedge = m_ve_hash[venode];
+                    }
+
+                    //  Get end connected node
+                    unsigned int enode = *index_run++;
+
+                    //  Get first connected node
+                    VC_Element *ipnode = 0;
+                    ipnode = m_vc_hash[inode];
+
+                    //  Get end connected node
+                    VC_Element *epnode = 0;
+                    epnode = m_vc_hash[enode];
+
+
+                    if( ipnode ) {
+                        if(pedge && pedge->nCount)
+                        {
+
+                            //      The initial node exists and connects to the start of an edge
+
+                            char buf[40];
+                            snprintf(buf, sizeof(buf), "%d_%d", inode, venode);
+                            std::string key(buf);
+
+                            connector_segment *pcs = NULL;
+                            std::unordered_map<std::string, connector_segment *>::iterator itce;
+                            itce = ce_connector_hash.find( key );
+                            if( itce == ce_connector_hash.end() ){
+                                ndelta += 2;
+                                pcs = new connector_segment;
+                                //                                pcs->type = TYPE_CE;
+                                //                                pcs->start = ipnode;
+                                //                                pcs->end = pedge;
+                                ce_connector_hash[key] = pcs;
+
+                                // capture and store geometry
+                                segment_pair pair;
+                                float *ppt = ipnode->pPoint;
+                                pair.e0 = *ppt++;
+                                pair.n0 = *ppt;
+
+                                if(edge_dir){
+                                    pair.e1 = pedge->pPoints[ 0 ];
+                                    pair.n1 = pedge->pPoints[ 1 ];
+                                }
+                                else{
+                                    int last_point_index = (pedge->nCount -1) * 2;
+                                    pair.e1 = pedge->pPoints[ last_point_index ];
+                                    pair.n1 = pedge->pPoints[ last_point_index + 1 ];
+                                }
+
+                                connector_segment_vector.push_back(pair);
+                                pcs->vbo_offset = seg_pair_index;               // use temporarily
+                                seg_pair_index ++;
+
+                                // calculate the centroid of this connector segment, used for viz testing
+                                double lat, lon;
+                                fromSM_Plugin( (pair.e0 + pair.e1)/2, (pair.n0 + pair.n1)/2, ref_lat, ref_lon, &lat, &lon );
+                                pcs->cs_lat_avg = lat;
+                                pcs->cs_lon_avg = lon;
+
+                            }
+                            else
+                                pcs = itce->second;
+
+
+                            line_segment_element *pls = new line_segment_element;
+                            pls->next = 0;
+                            //                            pls->n_points = 2;
+                            pls->priority = 0;
+                            pls->pcs = pcs;
+                            pls->ls_type = TYPE_CE;
+
+                            le_current->next = pls;             // hook it up
+                            le_current = pls;
+
+                        }
+                    }
+
+                    if(pedge && pedge->nCount){
+                        line_segment_element *pls = new line_segment_element;
+                        pls->next = 0;
+                        //                        pls->n_points = pedge->nCount;
+                        pls->priority = 0;
+                        pls->pedge = pedge;
+                        pls->ls_type = TYPE_EE;
+
+                        le_current->next = pls;             // hook it up
+                        le_current = pls;
+
+                    }   //pedge
+
+                    // end node
+                    if( epnode ) {
+
+                        if(ipnode){
+                            if(pedge && pedge->nCount){
+
+                                //wxString key;
+                                //key.Printf(_T("EC%d%d"), venode, enode);
+                                char buf[40];
+                                snprintf(buf, sizeof(buf), "%d_%d", venode, enode);
+                                std::string key(buf);
+
+                                connector_segment *pcs = NULL;
+                                std::unordered_map<std::string, connector_segment *>::iterator itec;
+                                itec = ec_connector_hash.find( key );
+                                if( itec == ec_connector_hash.end() ){
+                                    ndelta += 2;
+                                    pcs = new connector_segment;
+                                    //                                    pcs->type = TYPE_EC;
+                                    ec_connector_hash[key] = pcs;
+
+                                    // capture and store geometry
+                                    segment_pair pair;
+
+                                    if(!edge_dir){
+                                        pair.e0 = pedge->pPoints[ 0 ];
+                                        pair.n0 = pedge->pPoints[ 1 ];
+                                    }
+                                    else{
+                                        int last_point_index = (pedge->nCount -1) * 2;
+                                        pair.e0 = pedge->pPoints[ last_point_index ];
+                                        pair.n0 = pedge->pPoints[ last_point_index + 1 ];
+                                    }
+
+
+                                    float *ppt = epnode->pPoint;
+                                    pair.e1 = *ppt++;
+                                    pair.n1 = *ppt;
+
+                                    connector_segment_vector.push_back(pair);
+                                    pcs->vbo_offset = seg_pair_index;               // use temporarily
+                                    seg_pair_index ++;
+
+                                    // calculate the centroid of this connector segment, used for viz testing
+                                    double lat, lon;
+                                    fromSM_Plugin( (pair.e0 + pair.e1)/2, (pair.n0 + pair.n1)/2, ref_lat, ref_lon, &lat, &lon );
+                                    pcs->cs_lat_avg = lat;
+                                    pcs->cs_lon_avg = lon;
+
+                                }
+                                else
+                                    pcs = itec->second;
+
+                                line_segment_element *pls = new line_segment_element;
+                                pls->next = 0;
+                                //                                pls->n_points = 2;
+                                pls->priority = 0;
+                                pls->pcs = pcs;
+                                pls->ls_type = TYPE_EC;
+
+                                le_current->next = pls;             // hook it up
+                                le_current = pls;
+
+
+                            }
+                            else {
+                                //wxString key;
+                                //key.Printf(_T("CC%d%d"), inode, enode);
+                                char buf[40];
+                                snprintf(buf, sizeof(buf), "%d_%d", inode, enode);
+                                std::string key(buf);
+
+
+                                connector_segment *pcs = NULL;
+                                std::unordered_map<std::string, connector_segment *>::iterator itcc;
+                                itcc = cc_connector_hash.find( key );
+                                if( itcc == cc_connector_hash.end() ){
+                                    ndelta += 2;
+                                    pcs = new connector_segment;
+                                    //                                    pcs->type = TYPE_CC;
+                                    //                                    pcs->start = ipnode;
+                                    //                                    pcs->end = epnode;
+                                    cc_connector_hash[key] = pcs;
+
+                                    // capture and store geometry
+                                    segment_pair pair;
+
+                                    float *ppt = ipnode->pPoint;
+                                    pair.e0 = *ppt++;
+                                    pair.n0 = *ppt;
+
+                                    ppt = epnode->pPoint;
+                                    pair.e1 = *ppt++;
+                                    pair.n1 = *ppt;
+
+                                    connector_segment_vector.push_back(pair);
+                                    pcs->vbo_offset = seg_pair_index;               // use temporarily
+                                    seg_pair_index ++;
+
+                                    // calculate the centroid of this connector segment, used for viz testing
+                                    double lat, lon;
+                                    fromSM_Plugin( (pair.e0 + pair.e1)/2, (pair.n0 + pair.n1)/2, ref_lat, ref_lon, &lat, &lon );
+                                    pcs->cs_lat_avg = lat;
+                                    pcs->cs_lon_avg = lon;
+
+                                }
+                                else
+                                    pcs = itcc->second;
+
+                                line_segment_element *pls = new line_segment_element;
+                                pls->next = 0;
+                                //                                pls->n_points = 2;
+                                pls->priority = 0;
+                                pls->pcs = pcs;
+                                pls->ls_type = TYPE_CC;
+
+                                le_current->next = pls;             // hook it up
+                                le_current = pls;
+
+
+                            }
+                        }
+                    }
+
+
+                }  // for
+
+                //  All done, so assign the list to the object
+                obj->m_ls_list = list_top.next;    // skipping the empty first placeholder element
+
+                // we are all finished with the line segment index array, per object
+                free(obj->m_lsindex_array);
+                obj->m_lsindex_array = NULL;
+
+                top = top->next;
+            }
+        }
+    }
+    //    printf("time1 %f\n", sw.GetTime());
+
+    //  We have the total VBO point count, and a nice hashmap of the connector segments
+    nPoints += ndelta;          // allow for the connector segments
+
+    size_t vbo_byte_length = 2 * nPoints * sizeof(float);
+    m_vbo_byte_length = vbo_byte_length;
+
+    m_line_vertex_buffer = (float *)malloc( vbo_byte_length);
+    float *lvr = m_line_vertex_buffer;
+    size_t offset = 0;
+
+    //      Copy and edge points as floats,
+    //      and recording each segment's offset in the array
+    for( it = m_ve_hash.begin(); it != m_ve_hash.end(); ++it ) {
+        VE_Element *pedge = it->second;
+        int key = it->first;
+        if( pedge ) {
+            memcpy(lvr, pedge->pPoints, pedge->nCount * 2 * sizeof(float));
+            lvr += pedge->nCount * 2;
+
+            pedge->vbo_offset = offset;
+            offset += pedge->nCount * 2 * sizeof(float);
+        }
+//         else
+//             int yyp = 4;        //TODO Why are zero elements being inserted into m_ve_hash?
+    }
+
+    //      Now iterate on the hashmaps, adding the connector segments in the temporary vector to the VBO buffer
+    //      At the  same time, populate a vector, storing the pcs pointers to allow destruction at this class dtor.
+    //      This will allow us to destroy (automatically) the pcs hashmaps, and save some storage
+
+    std::unordered_map<std::string, connector_segment *>::iterator iter;
+
+    for( iter = ce_connector_hash.begin(); iter != ce_connector_hash.end(); ++iter )
+    {
+        connector_segment *pcs = iter->second;
+        m_pcs_vector.push_back(pcs);
+
+        segment_pair pair = connector_segment_vector.at(pcs->vbo_offset);
+        *lvr++ = pair.e0;
+        *lvr++ = pair.n0;
+        *lvr++ = pair.e1;
+        *lvr++ = pair.n1;
+
+        pcs->vbo_offset = offset;
+        offset += 4 * sizeof(float);
+    }
+
+    for( iter = ec_connector_hash.begin(); iter != ec_connector_hash.end(); ++iter )
+    {
+        connector_segment *pcs = iter->second;
+        m_pcs_vector.push_back(pcs);
+
+        segment_pair pair = connector_segment_vector.at(pcs->vbo_offset);
+        *lvr++ = pair.e0;
+        *lvr++ = pair.n0;
+        *lvr++ = pair.e1;
+        *lvr++ = pair.n1;
+
+        pcs->vbo_offset = offset;
+        offset += 4 * sizeof(float);
+    }
+
+    for( iter = cc_connector_hash.begin(); iter != cc_connector_hash.end(); ++iter )
+    {
+        connector_segment *pcs = iter->second;
+        m_pcs_vector.push_back(pcs);
+
+        segment_pair pair = connector_segment_vector.at(pcs->vbo_offset);
+        *lvr++ = pair.e0;
+        *lvr++ = pair.n0;
+        *lvr++ = pair.e1;
+        *lvr++ = pair.n1;
+
+        pcs->vbo_offset = offset;
+        offset += 4 * sizeof(float);
+    }
+
+    // And so we can empty the temp buffer
+    connector_segment_vector.clear();
+
+    // Wwe can convert the edge hashmap to a vector, to allow  us to destroy the hashmap
+    // and at the same time free up the point storage in the VE_Elements, since all the points
+    // are now in the VBO buffer
+    for( it = m_ve_hash.begin(); it != m_ve_hash.end(); ++it ) {
+        VE_Element *pedge = it->second;
+        if(pedge){
+            m_pve_vector.push_back(pedge);
+            free(pedge->pPoints);
+        }
+    }
+    m_ve_hash.clear();
+
+
+    // and we can empty the connector hashmap,
+    // and at the same time free up the point storage in the VC_Elements, since all the points
+    // are now in the VBO buffer
+    for( VC_Hash::iterator itc = m_vc_hash.begin(); itc != m_vc_hash.end(); ++itc ) {
+        VC_Element *pcs = itc->second;
+        if(pcs)
+            free(pcs->pPoint);
+        delete pcs;
+    }
+    m_vc_hash.clear();
+
+
+
+
+}
+
+
+
+#if 0
+void s57chart::AssembleLineGeometry( void )
+{
+            // Walk the hash tables to get the required buffer size
+
+            //  Start with the edge hash table
+            size_t nPoints = 0;
+            VE_Hash::iterator it;
+            for( it = old_m_ve_hash.begin(); it != old_m_ve_hash.end(); ++it ) {
+                VE_Element *pedge = it->second;
+                if( pedge ) {
+                    nPoints += pedge->nCount;
+                }
+            }
+
+            connector_key key;
+            int ndelta = 0;
+            //  Get the end node connected segments.  To do this, we
+            //  walk the Feature array and process each feature that potetially has a LINE type element
+            for( int i = 0; i < PRIO_NUM; ++i ) {
+                for( int j = 0; j < LUPNAME_NUM; j++ ) {
+                    ObjRazRules *top = razRules[i][j];
+                    while( top != NULL ) {
+                        S57Obj *obj = top->obj;
+
+                        for( int iseg = 0; iseg < obj->m_n_lsindex; iseg++ ) {
+                            int seg_index = iseg * 3;
+                            int *index_run = &obj->m_lsindex_array[seg_index];
+
+                            //  Get first connected node
+                            unsigned int inode = *index_run++;
+
+                            //  Get the edge
+                            unsigned int venode = *index_run++;
+                            VE_Element *pedge;
+                            pedge = old_m_ve_hash[venode];
+
+                            //  Get end connected node
+                            unsigned int enode = *index_run++;
+
+                            //  Get first connected node
+                            VC_Element *ipnode;
+                            ipnode = old_m_vc_hash[inode];
+
+                            //  Get end connected node
+                            VC_Element *epnode;
+                            epnode = old_m_vc_hash[enode];
+
+                            double e0, n0, e1, n1;
+
+                            if( ipnode ) {
+                                float *ppt = ipnode->pPoint;
+                                e0 = *ppt++;
+                                n0 = *ppt;
+                                if(pedge && pedge->nCount)
+                                {
+                                    e1 = pedge->pPoints[0];
+                                    n1 = pedge->pPoints[1];
+
+                                    //      The initial node exists and connects to the start of an edge
+                                    key.set(TYPE_CE, inode, venode);
+                                    if(old_m_connector_hash.find( key ) == old_m_connector_hash.end()){
+                                        ndelta += 2;
+                                        connector_segment *pcs = new connector_segment;
+                                        pcs->type = TYPE_CE;
+                                        pcs->start = ipnode;
+                                        pcs->end = pedge;
+                                        old_m_connector_hash[key] = pcs;
+                                    }
+                                }
+                            }
+
+                            if(pedge && pedge->nCount){
+                                e0 = pedge->pPoints[ (2 * (pedge->nCount - 1))];
+                                n0 = pedge->pPoints[ (2 * (pedge->nCount - 1)) + 1];
+
+                            }   //pedge
+
+                            // end node
+                            if( epnode ) {
+                                float *ppt = epnode->pPoint;
+                                e1 = *ppt++;
+                                n1 = *ppt;
+
+                                if(ipnode){
+                                    if(pedge && pedge->nCount){
+
+                                        key.set(TYPE_EC, venode, enode);
+
+                                        if(old_m_connector_hash.find( key ) == old_m_connector_hash.end()){
+                                            ndelta += 2;
+                                            connector_segment *pcs = new connector_segment;
+                                            pcs->type = TYPE_EC;
+                                            pcs->start = pedge;
+                                            pcs->end = epnode;
+                                            old_m_connector_hash[key] = pcs;
+                                        }
+                                    }
+                                    else {
+                                        key.set(TYPE_CC, inode, enode);
+
+                                        if(old_m_connector_hash.find( key ) == old_m_connector_hash.end()){
+                                            ndelta += 2;
+                                            connector_segment *pcs = new connector_segment;
+                                            pcs->type = TYPE_CC;
+                                            pcs->start = ipnode;
+                                            pcs->end = epnode;
+                                            old_m_connector_hash[key] = pcs;
+                                        }
+                                    }
+                                }
+                            }
+                            }  // for
+
+
+                            top = top->next;
+                            }
+                        }
+                    }
+
+                    //  We have the total VBO point count, and a nice hashmap of the connector segments
+                    nPoints += ndelta;
+
+                    size_t vbo_byte_length = 2 * nPoints * sizeof(float);
+                    m_vbo_byte_length = vbo_byte_length;
+
+                    m_line_vertex_buffer = (float *)malloc( vbo_byte_length);
+                    float *lvr = m_line_vertex_buffer;
+                    size_t offset = 0;
+
+                    //      Copy and convert the edge points from doubles to floats,
+                    //      and recording each segment's offset in the array
+                    for( it = old_m_ve_hash.begin(); it != old_m_ve_hash.end(); ++it ) {
+                        VE_Element *pedge = it->second;
+                        if( pedge ) {
+                            float *pp = pedge->pPoints;
+                            for(size_t i = 0 ; i < pedge->nCount ; i++){
+                                float x = *pp++;
+                                float y = *pp++;
+
+                                *lvr++ = (float)x;
+                                *lvr++ = (float)y;
+                            }
+
+                            pedge->vbo_offset = offset;
+                            offset += pedge->nCount * 2 * sizeof(float);
+
+                        }
+                    }
+
+                    //      Now iterate on the hashmap, adding the connector segments in the hashmap to the VBO buffer
+                    double e0, n0, e1, n1;
+                    float *ppt;
+                    VC_Element *ipnode;
+                    VC_Element *epnode;
+                    VE_Element *pedge;
+                    connected_segment_hash::iterator itc;
+                    for( itc = old_m_connector_hash.begin(); itc != old_m_connector_hash.end(); ++itc )
+                    {
+                        connector_segment *pcs = itc->second;
+
+                        switch(pcs->type){
+                            case TYPE_CC:
+                                ipnode = (VC_Element *)pcs->start;
+                                epnode = (VC_Element *)pcs->end;
+
+                                ppt = ipnode->pPoint;
+                                e0 = *ppt++;
+                                n0 = *ppt;
+
+                                ppt = epnode->pPoint;
+                                e1 = *ppt++;
+                                n1 = *ppt;
+
+                                *lvr++ = (float)e0;
+                                *lvr++ = (float)n0;
+                                *lvr++ = (float)e1;
+                                *lvr++ = (float)n1;
+
+                                pcs->vbo_offset = offset;
+                                offset += 4 * sizeof(float);
+
+                                break;
+
+                            case TYPE_CE:
+                                ipnode = (VC_Element *)pcs->start;
+                                ppt = ipnode->pPoint;
+                                e0 = *ppt++;
+                                n0 = *ppt;
+
+                                pedge = (VE_Element *)pcs->end;
+                                e1 = pedge->pPoints[ 0 ];
+                                n1 = pedge->pPoints[ 1 ];
+
+                                *lvr++ = (float)e0;
+                                *lvr++ = (float)n0;
+                                *lvr++ = (float)e1;
+                                *lvr++ = (float)n1;
+
+                                pcs->vbo_offset = offset;
+                                offset += 4 * sizeof(float);
+                                break;
+
+                            case TYPE_EC:
+                                pedge = (VE_Element *)pcs->start;
+                                e0 = pedge->pPoints[ (2 * (pedge->nCount - 1))];
+                                n0 = pedge->pPoints[ (2 * (pedge->nCount - 1)) + 1];
+
+                                epnode = (VC_Element *)pcs->end;
+                                ppt = epnode->pPoint;
+                                e1 = *ppt++;
+                                n1 = *ppt;
+
+                                *lvr++ = (float)e0;
+                                *lvr++ = (float)n0;
+                                *lvr++ = (float)e1;
+                                *lvr++ = (float)n1;
+
+                                pcs->vbo_offset = offset;
+                                offset += 4 * sizeof(float);
+
+                                break;
+                            default:
+                                break;
+                        }
+                    }
+
+                    // Now ready to walk the object array again, building the per-object list of renderable segments
+                    for( int i = 0; i < PRIO_NUM; ++i ) {
+                        for( int j = 0; j < LUPNAME_NUM; j++ ) {
+                            ObjRazRules *top = razRules[i][j];
+                            while( top != NULL ) {
+                                S57Obj *obj = top->obj;
+
+                                line_segment_element list_top;
+                                list_top.n_points = 0;
+                                list_top.next = 0;
+
+                                line_segment_element *le_current = &list_top;
+
+                                for( int iseg = 0; iseg < obj->m_n_lsindex; iseg++ ) {
+                                    int seg_index = iseg * 3;
+                                    int *index_run = &obj->m_lsindex_array[seg_index];
+
+                                    //  Get first connected node
+                                    unsigned int inode = *index_run++;
+
+                                    //  Get the edge
+                                    unsigned int venode = *index_run++;
+                                    VE_Element *pedge;
+                                    pedge = old_m_ve_hash[venode];
+
+                                    //  Get end connected node
+                                    unsigned int enode = *index_run++;
+
+                                    //  Get first connected node
+                                    VC_Element *ipnode;
+                                    ipnode = old_m_vc_hash[inode];
+
+                                    //  Get end connected node
+                                    VC_Element *epnode;
+                                    epnode = old_m_vc_hash[enode];
+
+                                    double e0=0, n0=0, e1, n1;
+
+                                    if( ipnode ) {
+                                        float *ppt = ipnode->pPoint;
+                                        e0 = *ppt++;
+                                        n0 = *ppt;
+
+                                        if(pedge && pedge->nCount)
+                                        {
+                                            key.set(TYPE_CE, inode, venode);
+
+                                            connected_segment_hash::iterator itcs = old_m_connector_hash.find( key );
+                                            if(itcs != old_m_connector_hash.end()){
+
+                                                connector_segment *pcs = itcs->second;
+
+                                                line_segment_element *pls = new line_segment_element;
+                                                pls->next = 0;
+                                                pls->vbo_offset = pcs->vbo_offset;
+                                                pls->n_points = 2;
+                                                pls->priority = 0;
+                                                pls->private0 = pcs;
+                                                pls->type = TYPE_CE;
+
+                                                //  Get the bounding box
+                                                e1 = pedge->pPoints[0];
+                                                n1 = pedge->pPoints[1];
+
+                                                wxBoundingBox box;
+                                                double lat, lon;
+                                                fromSM( e0, n0, ref_lat, ref_lon, &lat, &lon );
+                                                box.Expand(lon, lat);
+                                                fromSM( e1, n1, ref_lat, ref_lon, &lat, &lon );
+                                                box.Expand(lon, lat);
+
+                                                pls->lat_max = box.GetMaxY();
+                                                pls->lat_min = box.GetMinY();
+                                                pls->lon_max = box.GetMaxX();
+                                                pls->lon_min = box.GetMinX();
+
+
+                                                le_current->next = pls;             // hook it up
+                                                le_current = pls;
+                                            }
+                                        }
+                                    }
+
+                                    if(pedge && pedge->nCount){
+                                        line_segment_element *pls = new line_segment_element;
+                                        pls->next = 0;
+                                        pls->vbo_offset = pedge->vbo_offset;
+                                        pls->n_points = pedge->nCount;
+                                        pls->priority = 0;
+                                        pls->lat_max = pedge->BBox.GetMaxLat();
+                                        pls->lat_min = pedge->BBox.GetMinLat();
+                                        pls->lon_max = pedge->BBox.GetMaxLon();
+                                        pls->lon_min = pedge->BBox.GetMinLon();
+                                        pls->private0 = pedge;
+                                        pls->type = TYPE_EE;
+
+                                        le_current->next = pls;             // hook it up
+                                        le_current = pls;
+
+                                        e0 = pedge->pPoints[ (2 * (pedge->nCount - 1))];
+                                        n0 = pedge->pPoints[ (2 * (pedge->nCount - 1)) + 1];
+
+
+                                    }   //pedge
+
+                                    // end node
+                                    if( epnode ) {
+                                        float *ppt = epnode->pPoint;
+                                        e1 = *ppt++;
+                                        n1 = *ppt;
+
+                                        if(ipnode){
+                                            if(pedge && pedge->nCount){
+
+                                                key.set(TYPE_EC, venode, enode);
+
+                                                connected_segment_hash::iterator itcs = old_m_connector_hash.find( key );
+                                                if(itcs != old_m_connector_hash.end()){
+                                                    connector_segment *pcs = itcs->second;
+
+                                                    line_segment_element *pls = new line_segment_element;
+                                                    pls->next = 0;
+                                                    pls->vbo_offset = pcs->vbo_offset;
+                                                    pls->n_points = 2;
+                                                    pls->priority = 0;
+                                                    pls->private0 = pcs;
+                                                    pls->type = TYPE_EC;
+
+                                                    double lat1, lon1, lat2, lon2;
+                                                    fromSM( e0, n0, ref_lat, ref_lon, &lat1, &lon1 );
+                                                    fromSM( e1, n1, ref_lat, ref_lon, &lat2, &lon2 );
+
+                                                    LLBBox box;
+                                                    box.SetFromSegment(lat1, lon1, lat2, lon2);
+pls->lat_max = box.GetMaxLat();
+                                                    pls->lat_min = box.GetMinLat();
+                                                    pls->lon_max = box.GetMaxLon();
+                                                    pls->lon_min = box.GetMinLon();
+
+                                                    le_current->next = pls;             // hook it up
+                                                    le_current = pls;
+                                                }
+                                            }
+                                            else {
+                                                key.set(TYPE_CC, inode, enode);
+
+                                                connected_segment_hash::iterator itcs = old_m_connector_hash.find( key );
+                                                if(itcs != old_m_connector_hash.end()){
+                                                    connector_segment *pcs = itcs->second;
+
+                                                    line_segment_element *pls = new line_segment_element;
+                                                    pls->next = 0;
+                                                    pls->vbo_offset = pcs->vbo_offset;
+                                                    pls->n_points = 2;
+                                                    pls->priority = 0;
+                                                    pls->private0 = pcs;
+                                                    pls->type = TYPE_CC;
+
+                                                    double lat1, lon1, lat2, lon2;
+                                                    fromSM( e0, n0, ref_lat, ref_lon, &lat1, &lon1 );
+                                                    fromSM( e1, n1, ref_lat, ref_lon, &lat2, &lon2 );
+
+                                                    LLBBox box;
+                                                    box.SetFromSegment(lat1, lon1, lat2, lon2);
+
+                                                    pls->lat_max = box.GetMaxLat();
+                                                    pls->lat_min = box.GetMinLat();
+                                                    pls->lon_max = box.GetMaxLon();
+                                                    pls->lon_min = box.GetMinLon();
+
+                                                    le_current->next = pls;             // hook it up
+                                                    le_current = pls;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }  // for
+
+                                //  All done, so assign the list to the object
+                                obj->m_ls_list = list_top.next;    // skipping the empty first placeholder element
+
+
+                                top = top->next;
+                            }
+                        }
+                    }
+
+}
+#endif
+
+void s57chart::BuildLineVBO( void )
+{
+#ifdef ocpnUSE_GL
+    // cm93 cannot efficiently use VBO, since the edge list is discovered incrementally,
+    // and this would require rebuilding the VBO for each new cell that is loaded.
+
+    if(CHART_TYPE_CM93 == GetChartType())
+        return;
+
+    if(!g_b_EnableVBO)
+        return;
+
+    if(m_LineVBO_name == -1){
+
+        //      Create the VBO
+        GLuint vboId;
+        (s_glGenBuffers)(1, &vboId);
+
+         // bind VBO in order to use
+        (s_glBindBuffer)(GL_ARRAY_BUFFER, vboId);
+
+        // upload data to VBO
+        glEnableClientState(GL_VERTEX_ARRAY);             // activate vertex coords array
+        (s_glBufferData)(GL_ARRAY_BUFFER, m_vbo_byte_length, m_line_vertex_buffer, GL_STATIC_DRAW);
+
+        glDisableClientState(GL_VERTEX_ARRAY);            // deactivate vertex array
+        (s_glBindBuffer)(GL_ARRAY_BUFFER, 0);
+
+        //  Loop and populate all the objects
+        for( int i = 0; i < PRIO_NUM; ++i ) {
+            for( int j = 0; j < LUPNAME_NUM; j++ ) {
+                ObjRazRules *top = razRules[i][j];
+                while( top != NULL ) {
+                    S57Obj *obj = top->obj;
+                    obj->auxParm2 = vboId;
+                    top = top->next;
+                }
+            }
+        }
+
+        m_LineVBO_name = vboId;
+
+    }
+#endif
+}
+
+
+/*              RectRegion:
+ *                      This is the Screen region desired to be updated.  Will be either 1 rectangle(full screen)
+ *                      or two rectangles (panning with FBO accelerated pan logic)
+ *
+ *              Region:
+ *                      This is the LLRegion describing the quilt active region for this chart.
+ *
+ *              So, Actual rendering area onscreen should be clipped to the intersection of the two regions.
+ */
+
+bool s57chart::RenderRegionViewOnGL( const wxGLContext &glc, const ViewPort& VPoint,
+                                     const OCPNRegion &RectRegion, const LLRegion &Region )
+{
+    return DoRenderRegionViewOnGL( glc, VPoint, RectRegion, Region, false );
 }
 
 bool s57chart::RenderOverlayRegionViewOnGL( const wxGLContext &glc, const ViewPort& VPoint,
-        const wxRegion &Region )
+                                            const OCPNRegion &RectRegion, const LLRegion &Region )
 {
-    return DoRenderRegionViewOnGL( glc, VPoint, Region, true );
+    return DoRenderRegionViewOnGL( glc, VPoint, RectRegion, Region, true );
 }
 
 bool s57chart::DoRenderRegionViewOnGL( const wxGLContext &glc, const ViewPort& VPoint,
-        const wxRegion &Region, bool b_overlay )
+                                       const OCPNRegion &RectRegion, const LLRegion &Region, bool b_overlay )
 {
+#ifdef ocpnUSE_GL
 //     CALLGRIND_START_INSTRUMENTATION
 //      g_bDebugS57 = true;
 
@@ -1471,10 +2923,6 @@ bool s57chart::DoRenderRegionViewOnGL( const wxGLContext &glc, const ViewPort& V
 
     SetVPParms( VPoint );
 
-    bool force_new_view = false;
-
-    if( Region != m_last_Region ) force_new_view = true;
-
     ps52plib->PrepareForRender();
 
     if( m_plib_state_hash != ps52plib->GetStateHash() ) {
@@ -1483,6 +2931,8 @@ bool s57chart::DoRenderRegionViewOnGL( const wxGLContext &glc, const ViewPort& V
         ClearRenderedTextCache();                       // and reset the text renderer,
                                                         //for the case where depth(height) units change
         ResetPointBBoxes( m_last_vp, VPoint );
+        SetSafetyContour();
+
         m_plib_state_hash = ps52plib->GetStateHash();
 
     }
@@ -1491,326 +2941,73 @@ bool s57chart::DoRenderRegionViewOnGL( const wxGLContext &glc, const ViewPort& V
         ResetPointBBoxes( m_last_vp, VPoint );
     }
 
+    BuildLineVBO();
     SetLinePriorities();
 
     //        Clear the text declutter list
     ps52plib->ClearTextList();
 
-    //    How many rectangles in the Region?
-    int n_rect = 0;
-    wxRegionIterator clipit( Region );
-    while( clipit ) {
-        wxRect rect = clipit.GetRect();
-        clipit++;
-        n_rect++;
-    }
-    /*
-     if(n_rect > 1)
-     {
-     printf("S57 n_rect: %d\n", n_rect);
+#if 0
+    wxColour color = GetGlobalColor( _T ( "NODTA" ) );
+    float r, g, b;
+    if( color.IsOk() ) {
+        r = color.Red() / 255.;
+        g = color.Green() / 255.;
+        b = color.Blue() / 255.;
+    } else
+        r = g = b = 0;
 
-     wxRegionIterator upd ( Region );
-     while ( upd )
-     {
-     wxRect rect = upd.GetRect();
-     printf ( "   S57 Region Rect:  %d %d %d %d\n", rect.x, rect.y, rect.width, rect.height );
-     upd ++ ;
-     }
-     }
-     */
+    glColor3f( r, g, b ); /* nodta color */
+#endif
 
-    //    Adjust for rotation
-    glPushMatrix();
+    ViewPort vp = VPoint;
 
-    if( fabs( VPoint.rotation ) > 0.01 ) {
+    // region always has either 1 or 2 rectangles (full screen or panning rectangles)
+    for(OCPNRegionIterator upd ( RectRegion ); upd.HaveRects(); upd.NextRect()) {
+        LLRegion chart_region = vp.GetLLRegion(upd.GetRect());
+        chart_region.Intersect(Region);
 
-        double w = VPoint.pix_width;
-        double h = VPoint.pix_height;
+        if(!chart_region.Empty()) {
 
-        //    Rotations occur around 0,0, so calculate a post-rotate translation factor
-        double angle = VPoint.rotation;
-        angle -= VPoint.skew;
+            //TODO  I think this needs nore work for alternate Projections...
+            //  cm93 vpoint crossing Greenwich, panning east, was rendering areas incorrectly.
+            ViewPort cvp = glChartCanvas::ClippedViewport(VPoint, chart_region);
 
-        double ddx = ( w * cos( -angle ) - h * sin( -angle ) - w ) / 2;
-        double ddy = ( h * cos( -angle ) + w * sin( -angle ) - h ) / 2;
+            if(CHART_TYPE_CM93 == GetChartType()){
+                // for now I will revert to the faster rectangle clipping now that rendering order is resolved
+//                glChartCanvas::SetClipRegion(cvp, chart_region);
+                glChartCanvas::SetClipRect(cvp, upd.GetRect(), false);
+            }
+            else
+                glChartCanvas::SetClipRect(cvp, upd.GetRect(), false);
 
-        glRotatef( angle * 180. / PI, 0, 0, 1 );
-
-        glTranslatef( ddx, ddy, 0 );                 // post rotate translation
-    }
-
-    //    Arbitrary optimization....
-    //    It is cheaper to draw the entire screen if the rectangle count is large,
-    //    as is the case for CM93 charts with non-rectilinear borders
-    //    However, most (all?) pan operations on "normal" charts will be small rect count
-    if( n_rect < 4 ) {
-        wxRegionIterator upd( Region ); // get the Region rect list
-        while( upd ) {
-            wxRect rect = upd.GetRect();
-
-            //  Build synthetic ViewPort on this rectangle
-            //  Especially, we want the BBox to be accurate in order to
-            //  render only those objects actually visible in this region
-
-            ViewPort temp_vp = VPoint;
-            double temp_lon_left, temp_lat_bot, temp_lon_right, temp_lat_top;
-
-            GetPixPoint( rect.x, rect.y, &temp_lat_top, &temp_lon_left, (ViewPort *) &VPoint );
-            GetPixPoint( rect.x + rect.width, rect.y + rect.height, &temp_lat_bot, &temp_lon_right,
-                    (ViewPort *) &VPoint );
-
-            if( temp_lon_right < temp_lon_left )        // presumably crossing Greenwich
-            temp_lon_right += 360.;
-
-            temp_vp.GetBBox().SetMin( temp_lon_left, temp_lat_bot );
-            temp_vp.GetBBox().SetMax( temp_lon_right, temp_lat_top );
-
-            //      Allow some slop in the viewport
-            //            double margin = wxMin(temp_vp.GetBBox().GetWidth(), temp_vp.GetBBox().GetHeight()) * 0.05;
-            //            temp_vp.GetBBox().EnLarge(margin);
-
-            if( g_bDebugS57 ) printf( "   S57 Render Box:  %d %d %d %d\n", rect.x, rect.y,
-                    rect.width, rect.height );
-
-            SetClipRegionGL( glc, temp_vp, rect, !b_overlay );
-            DoRenderRectOnGL( glc, temp_vp, rect );
-
-            upd++;
+            ps52plib->m_last_clip_rect = upd.GetRect();
+            glPushMatrix(); //    Adjust for rotation
+            glChartCanvas::RotateToViewPort(VPoint);
+            DoRenderOnGL( glc, cvp );
+            glPopMatrix();
+            glChartCanvas::DisableClipRegion();
         }
-    } else {
-        wxRect rect = Region.GetBox();
-        if( g_bDebugS57 ) printf( "   S57 Render GetBox:  %d %d %d %d\n", rect.x, rect.y,
-                rect.width, rect.height );
-
-        //  Build synthetic ViewPort on this rectangle
-        //  Especially, we want the BBox to be accurate in order to
-        //  render only those objects actually visible in this region
-
-        ViewPort temp_vp = VPoint;
-        double temp_lon_left, temp_lat_bot, temp_lon_right, temp_lat_top;
-
-        GetPixPoint( rect.x, rect.y, &temp_lat_top, &temp_lon_left, (ViewPort *) &VPoint );
-        GetPixPoint( rect.x + rect.width, rect.y + rect.height, &temp_lat_bot, &temp_lon_right,
-                (ViewPort *) &VPoint );
-
-        if( temp_lon_right < temp_lon_left )        // presumably crossing Greenwich
-        temp_lon_right += 360.;
-
-        temp_vp.GetBBox().SetMin( temp_lon_left, temp_lat_bot );
-        temp_vp.GetBBox().SetMax( temp_lon_right, temp_lat_top );
-
-        //      Allow some slop in the viewport
-        //            double margin = wxMin(temp_vp.GetBBox().GetWidth(), temp_vp.GetBBox().GetHeight()) * 0.05;
-        //            temp_vp.GetBBox().EnLarge(margin);
-
-        SetClipRegionGL( glc, VPoint, Region, !b_overlay );
-        DoRenderRectOnGL( glc, temp_vp, rect );
-
     }
+
 //      Update last_vp to reflect current state
     m_last_vp = VPoint;
-    m_last_Region = Region;
 
-    glPopMatrix();
 
 //      CALLGRIND_STOP_INSTRUMENTATION
 
+#endif
     return true;
 }
 
-void s57chart::SetClipRegionGL( const wxGLContext &glc, const ViewPort& VPoint,
-        const wxRegion &Region, bool b_render_nodta )
+bool s57chart::DoRenderOnGL( const wxGLContext &glc, const ViewPort& VPoint )
 {
-    if( g_b_useStencil ) {
-        //    Create a stencil buffer for clipping to the region
-        glEnable( GL_STENCIL_TEST );
-        glStencilMask( 0x1 );                 // write only into bit 0 of the stencil buffer
-        glClear( GL_STENCIL_BUFFER_BIT );
+#ifdef ocpnUSE_GL
 
-        //    We are going to write "1" into the stencil buffer wherever the region is valid
-        glStencilFunc( GL_ALWAYS, 1, 1 );
-        glStencilOp( GL_KEEP, GL_KEEP, GL_REPLACE );
-    } else              //  Use depth buffer for clipping
-    {
-        glEnable( GL_DEPTH_TEST ); // to enable writing to the depth buffer
-        glDepthFunc( GL_ALWAYS );  // to ensure everything you draw passes
-        glDepthMask( GL_TRUE );    // to allow writes to the depth buffer
-
-        glClear( GL_DEPTH_BUFFER_BIT ); // for a fresh start
-    }
-
-    //    As a convenience, while we are creating the stencil or depth mask,
-    //    also render the default "NODTA" background if selected
-    if( b_render_nodta ) {
-        wxColour color = GetGlobalColor( _T ( "NODTA" ) );
-        float r, g, b;
-        if( color.IsOk() ) {
-            r = color.Red() / 255.;
-            g = color.Green() / 255.;
-            b = color.Blue() / 255.;
-        } else
-            r = g = b = 0;
-
-        glColor3f( r, g, b );
-        glColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );  // enable color buffer
-
-    } else {
-        glColorMask( GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE );   // disable color buffer
-    }
-
-    wxRegionIterator upd( Region ); // get the Region rect list
-    while( upd ) {
-        wxRect rect = upd.GetRect();
-
-        if( g_b_useStencil ) {
-            glBegin( GL_QUADS );
-
-            glVertex2f( rect.x, rect.y );
-            glVertex2f( rect.x + rect.width, rect.y );
-            glVertex2f( rect.x + rect.width, rect.y + rect.height );
-            glVertex2f( rect.x, rect.y + rect.height );
-            glEnd();
-
-        } else              //  Use depth buffer for clipping
-        {
-            if( g_bDebugS57 ) printf( "   Depth buffer Region rect:  %d %d %d %d\n", rect.x, rect.y,
-                    rect.width, rect.height );
-
-            glBegin( GL_QUADS );
-
-            //    Depth buffer runs from 0 at z = 1 to 1 at z = -1
-            //    Draw the clip geometry at z = 0.5, giving a depth buffer value of 0.25
-            //    Subsequent drawing at z=0 (depth = 0.5) will pass if using glDepthFunc(GL_GREATER);
-            glVertex3f( rect.x, rect.y, 0.5 );
-            glVertex3f( rect.x + rect.width, rect.y, 0.5 );
-            glVertex3f( rect.x + rect.width, rect.y + rect.height, 0.5 );
-            glVertex3f( rect.x, rect.y + rect.height, 0.5 );
-            glEnd();
-
-        }
-
-        upd++;
-
-    }
-
-    if( g_b_useStencil ) {
-        //    Now set the stencil ops to subsequently render only where the stencil bit is "1"
-        glStencilFunc( GL_EQUAL, 1, 1 );
-        glStencilOp( GL_KEEP, GL_KEEP, GL_KEEP );
-
-    } else {
-        glDepthFunc( GL_GREATER );                          // Set the test value
-        glDepthMask( GL_FALSE );                            // disable depth buffer
-    }
-
-    glColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );  // re-enable color buffer
-
-}
-
-void s57chart::SetClipRegionGL( const wxGLContext &glc, const ViewPort& VPoint, const wxRect &Rect,
-        bool b_render_nodta )
-{
-    if( g_b_useStencil ) {
-        //    Create a stencil buffer for clipping to the region
-        glEnable( GL_STENCIL_TEST );
-        glStencilMask( 0x1 );                 // write only into bit 0 of the stencil buffer
-        glClear( GL_STENCIL_BUFFER_BIT );
-
-        //    We are going to write "1" into the stencil buffer wherever the region is valid
-        glStencilFunc( GL_ALWAYS, 1, 1 );
-        glStencilOp( GL_KEEP, GL_KEEP, GL_REPLACE );
-
-    } else              //  Use depth buffer for clipping
-    {
-        glEnable( GL_DEPTH_TEST ); // to enable writing to the depth buffer
-        glDepthFunc( GL_ALWAYS );  // to ensure everything you draw passes
-        glDepthMask( GL_TRUE );    // to allow writes to the depth buffer
-        glClear( GL_DEPTH_BUFFER_BIT ); // for a fresh start
-    }
-
-    //    As a convenience, while we are creating the stencil or depth mask,
-    //    also render the default "NODTA" background if selected
-    if( b_render_nodta ) {
-        wxColour color = GetGlobalColor( _T ( "NODTA" ) );
-        float r, g, b;
-        if( color.IsOk() ) {
-            r = color.Red() / 255.;
-            g = color.Green() / 255.;
-            b = color.Blue() / 255.;
-        } else
-            r = g = b = 0;
-        glColor3f( r, g, b );
-        glColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );  // enable color buffer
-
-    } else {
-        glColorMask( GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE );   // disable color buffer
-    }
-
-    if( g_b_useStencil ) {
-        glBegin( GL_QUADS );
-
-        glVertex2f( Rect.x, Rect.y );
-        glVertex2f( Rect.x + Rect.width, Rect.y );
-        glVertex2f( Rect.x + Rect.width, Rect.y + Rect.height );
-        glVertex2f( Rect.x, Rect.y + Rect.height );
-        glEnd();
-
-    } else              //  Use depth buffer for clipping
-    {
-        if( g_bDebugS57 ) printf( "   Depth buffer rect:  %d %d %d %d\n", Rect.x, Rect.y,
-                Rect.width, Rect.height );
-
-        glBegin( GL_QUADS );
-
-        //    Depth buffer runs from 0 at z = 1 to 1 at z = -1
-        //    Draw the clip geometry at z = 0.5, giving a depth buffer value of 0.25
-        //    Subsequent drawing at z=0 (depth = 0.5) will pass if using glDepthFunc(GL_GREATER);
-        glVertex3f( Rect.x, Rect.y, 0.5 );
-        glVertex3f( Rect.x + Rect.width, Rect.y, 0.5 );
-        glVertex3f( Rect.x + Rect.width, Rect.y + Rect.height, 0.5 );
-        glVertex3f( Rect.x, Rect.y + Rect.height, 0.5 );
-        glEnd();
-
-    }
-
-    if( g_b_useStencil ) {
-        //    Now set the stencil ops to subsequently render only where the stencil bit is "1"
-        glStencilFunc( GL_EQUAL, 1, 1 );
-        glStencilOp( GL_KEEP, GL_KEEP, GL_KEEP );
-
-    } else {
-        glDepthFunc( GL_GREATER );                          // Set the test value
-        glDepthMask( GL_FALSE );                            // disable depth buffer
-    }
-
-    glColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );  // re-enable color buffer
-
-}
-
-bool s57chart::DoRenderRectOnGL( const wxGLContext &glc, const ViewPort& VPoint, wxRect &rect )
-{
     int i;
     ObjRazRules *top;
     ObjRazRules *crnt;
-
     ViewPort tvp = VPoint;                    // undo const  TODO fix this in PLIB
-
-    //    If the ViewPort is unrotated, we can use a simple (fast) scissor test instead
-    //    of a stencil or depth buffer clipping algorithm.....
-    /*
-     if(fabs(VPoint.rotation) < 0.01)
-     {
-
-     glScissor(rect.x, VPoint.pix_height-rect.height-rect.y, rect.width, rect.height);
-     glEnable(GL_SCISSOR_TEST);
-     glDisable (GL_STENCIL_TEST);
-     glDisable (GL_DEPTH_TEST);
-
-     }
-     */
-    if( g_b_useStencil ) glEnable( GL_STENCIL_TEST );
-    else
-        glEnable( GL_DEPTH_TEST );
 
     //      Render the areas quickly
     for( i = 0; i < PRIO_NUM; ++i ) {
@@ -1821,7 +3018,8 @@ bool s57chart::DoRenderRectOnGL( const wxGLContext &glc, const ViewPort& VPoint,
         while( top != NULL ) {
             crnt = top;
             top = top->next;               // next object
-            ps52plib->RenderAreaToGL( glc, crnt, &tvp, rect );
+            crnt->sm_transform_parms = &vp_transform;
+            ps52plib->RenderAreaToGL( glc, crnt, &tvp );
         }
     }
 
@@ -1833,14 +3031,16 @@ bool s57chart::DoRenderRectOnGL( const wxGLContext &glc, const ViewPort& VPoint,
         while( top != NULL ) {
             crnt = top;
             top = top->next;               // next object
-            ps52plib->RenderObjectToGL( glc, crnt, &tvp, rect );
+            crnt->sm_transform_parms = &vp_transform;
+            ps52plib->RenderObjectToGL( glc, crnt, &tvp );
         }
 
         top = razRules[i][2];           //LINES
         while( top != NULL ) {
             ObjRazRules *crnt = top;
             top = top->next;
-            ps52plib->RenderObjectToGL( glc, crnt, &tvp, rect );
+            crnt->sm_transform_parms = &vp_transform;
+            ps52plib->RenderObjectToGL( glc, crnt, &tvp );
         }
 
         if( ps52plib->m_nSymbolStyle == SIMPLIFIED ) top = razRules[i][0];       //SIMPLIFIED Points
@@ -1850,32 +3050,31 @@ bool s57chart::DoRenderRectOnGL( const wxGLContext &glc, const ViewPort& VPoint,
         while( top != NULL ) {
             crnt = top;
             top = top->next;
-            ps52plib->RenderObjectToGL( glc, crnt, &tvp, rect );
+            crnt->sm_transform_parms = &vp_transform;
+            ps52plib->RenderObjectToGL( glc, crnt, &tvp );
         }
 
     }
 
-    glDisable( GL_STENCIL_TEST );
-    glDisable( GL_DEPTH_TEST );
-    glDisable( GL_SCISSOR_TEST );
+#endif          //#ifdef ocpnUSE_GL
 
     return true;
 }
 
 bool s57chart::RenderRegionViewOnDC( wxMemoryDC& dc, const ViewPort& VPoint,
-        const wxRegion &Region )
+        const OCPNRegion &Region )
 {
     return DoRenderRegionViewOnDC( dc, VPoint, Region, false );
 }
 
 bool s57chart::RenderOverlayRegionViewOnDC( wxMemoryDC& dc, const ViewPort& VPoint,
-        const wxRegion &Region )
+        const OCPNRegion &Region )
 {
     return DoRenderRegionViewOnDC( dc, VPoint, Region, true );
 }
 
 bool s57chart::DoRenderRegionViewOnDC( wxMemoryDC& dc, const ViewPort& VPoint,
-        const wxRegion &Region, bool b_overlay )
+        const OCPNRegion &Region, bool b_overlay )
 {
     SetVPParms( VPoint );
 
@@ -1891,6 +3090,7 @@ bool s57chart::DoRenderRegionViewOnDC( wxMemoryDC& dc, const ViewPort& VPoint,
         ClearRenderedTextCache();                       // and reset the text renderer,
                                                         //for the case where depth(height) units change
         ResetPointBBoxes( m_last_vp, VPoint );
+        SetSafetyContour();
     }
 
     if( VPoint.view_scale_ppm != m_last_vp.view_scale_ppm ) {
@@ -1925,11 +3125,11 @@ bool s57chart::DoRenderRegionViewOnDC( wxMemoryDC& dc, const ViewPort& VPoint,
         pDIB->SelectIntoDC( dc_org );
 
         //    Decompose the region into rectangles, and fetch them into the target dc
-        wxRegionIterator upd( Region ); // get the requested rect list
-        while( upd ) {
+        OCPNRegionIterator upd( Region ); // get the requested rect list
+        while( upd.HaveRects() ) {
             wxRect rect = upd.GetRect();
             dc_clone.Blit( rect.x, rect.y, rect.width, rect.height, &dc_org, rect.x, rect.y );
-            upd++;
+            upd.NextRect();
         }
 
         dc_clone.SelectObject( wxNullBitmap );
@@ -1969,6 +3169,7 @@ bool s57chart::RenderViewOnDC( wxMemoryDC& dc, const ViewPort& VPoint )
         m_bLinePrioritySet = false;                     // need to reset line priorities
         UpdateLUPs( this );                               // and update the LUPs
         ClearRenderedTextCache();                       // and reset the text renderer
+        SetSafetyContour();
     }
 
     SetLinePriorities();
@@ -2074,8 +3275,8 @@ bool s57chart::DoRenderViewOnDC( wxMemoryDC& dc, const ViewPort& VPoint, RenderT
 
     //      Using regions, calculate re-usable area of pDIB
 
-    wxRegion rgn_last( 0, 0, VPoint.pix_width, VPoint.pix_height );
-    wxRegion rgn_new( rul.x, rul.y, rlr.x - rul.x, rlr.y - rul.y );
+    OCPNRegion rgn_last( 0, 0, VPoint.pix_width, VPoint.pix_height );
+    OCPNRegion rgn_new( rul.x, rul.y, rlr.x - rul.x, rlr.y - rul.y );
     rgn_last.Intersect( rgn_new );            // intersection is reusable portion
 
     if( bNewVP && ( NULL != pDIB ) && !rgn_last.IsEmpty() ) {
@@ -2121,12 +3322,12 @@ bool s57chart::DoRenderViewOnDC( wxMemoryDC& dc, const ViewPort& VPoint, RenderT
 
         pDIB->SelectIntoDC( dc );
 
-        wxRegion rgn_delta( 0, 0, VPoint.pix_width, VPoint.pix_height );
-        wxRegion rgn_reused( desx, desy, wu, hu );
+        OCPNRegion rgn_delta( 0, 0, VPoint.pix_width, VPoint.pix_height );
+        OCPNRegion rgn_reused( desx, desy, wu, hu );
         rgn_delta.Subtract( rgn_reused );
 
-        wxRegionIterator upd( rgn_delta ); // get the update rect list
-        while( upd ) {
+        OCPNRegionIterator upd( rgn_delta ); // get the update rect list
+        while( upd.HaveRects() ) {
             wxRect rect = upd.GetRect();
 
 //      Build temp ViewPort on this region
@@ -2146,12 +3347,12 @@ bool s57chart::DoRenderViewOnDC( wxMemoryDC& dc, const ViewPort& VPoint, RenderT
             fromSM( temp_easting_lr, temp_northing_lr, ref_lat, ref_lon, &temp_lat_bot,
                     &temp_lon_right );
 
-            temp_vp.GetBBox().SetMin( temp_lon_left, temp_lat_bot );
-            temp_vp.GetBBox().SetMax( temp_lon_right, temp_lat_top );
+            temp_vp.GetBBox().Set( temp_lat_bot, temp_lon_left,
+                                   temp_lat_top, temp_lon_right );
 
             //      Allow some slop in the viewport
             //    TODO Investigate why this fails if greater than 5 percent
-            double margin = wxMin(temp_vp.GetBBox().GetWidth(), temp_vp.GetBBox().GetHeight())
+            double margin = wxMin(temp_vp.GetBBox().GetLonRange(), temp_vp.GetBBox().GetLatRange())
                     * 0.05;
             temp_vp.GetBBox().EnLarge( margin );
 
@@ -2160,7 +3361,7 @@ bool s57chart::DoRenderViewOnDC( wxMemoryDC& dc, const ViewPort& VPoint, RenderT
 
             DCRenderRect( dc, temp_vp, &rect );
 
-            upd++;
+            upd.NextRect();
         }
 
         dc.SelectObject( wxNullBitmap );
@@ -2222,6 +3423,12 @@ int s57chart::DCRenderRect( wxMemoryDC& dcinput, const ViewPort& vp, wxRect* rec
     pb_spec.x = rect->x;
     pb_spec.y = rect->y;
 
+#ifdef ocpnUSE_ocpnBitmap
+    pb_spec.b_revrgb = true;
+#else
+    pb_spec.b_revrgb = false;
+#endif
+
     // Preset background
     wxColour color = GetGlobalColor( _T ( "NODTA" ) );
     unsigned char r, g, b;
@@ -2261,6 +3468,7 @@ int s57chart::DCRenderRect( wxMemoryDC& dcinput, const ViewPort& vp, wxRect* rec
         while( top != NULL ) {
             crnt = top;
             top = top->next;               // next object
+            crnt->sm_transform_parms = &vp_transform;
             ps52plib->RenderAreaToDC( &dcinput, crnt, &tvp, &pb_spec );
         }
     }
@@ -2322,6 +3530,7 @@ bool s57chart::DCRenderLPB( wxMemoryDC& dcinput, const ViewPort& vp, wxRect* rec
         while( top != NULL ) {
             crnt = top;
             top = top->next;               // next object
+            crnt->sm_transform_parms = &vp_transform;
             ps52plib->RenderObjectToDC( &dcinput, crnt, &tvp );
         }
 
@@ -2329,6 +3538,7 @@ bool s57chart::DCRenderLPB( wxMemoryDC& dcinput, const ViewPort& vp, wxRect* rec
         while( top != NULL ) {
             ObjRazRules *crnt = top;
             top = top->next;
+            crnt->sm_transform_parms = &vp_transform;
             ps52plib->RenderObjectToDC( &dcinput, crnt, &tvp );
         }
 
@@ -2339,6 +3549,7 @@ bool s57chart::DCRenderLPB( wxMemoryDC& dcinput, const ViewPort& vp, wxRect* rec
         while( top != NULL ) {
             crnt = top;
             top = top->next;
+            crnt->sm_transform_parms = &vp_transform;
             ps52plib->RenderObjectToDC( &dcinput, crnt, &tvp );
         }
 
@@ -2361,11 +3572,33 @@ bool s57chart::IsCellOverlayType( char *pFullPath )
     wxFileName fn( wxString( pFullPath, wxConvUTF8 ) );
     //      Get the "Usage" character
     wxString cname = fn.GetName();
-    return ( cname[2] == 'L' );
+    return ( (cname[2] == 'L') || (cname[2] == 'A'));
 }
 
 InitReturn s57chart::Init( const wxString& name, ChartInitFlag flags )
 {
+    // Really can only Init and use S57 chart if the S52 Presentation Library is present and OK
+    if( (NULL ==ps52plib) || !(ps52plib->m_bOK) )
+        return INIT_FAIL_REMOVE;
+    
+    wxString ext;
+    if(name.Upper().EndsWith(".XZ")) {
+        ext = wxFileName(name.Left(name.Length()-3)).GetExt();
+        
+        // decompress to temp file to allow seeking
+        m_TempFilePath = wxFileName::GetTempDir() + wxFileName::GetPathSeparator() +
+            wxFileName(name).GetName();
+
+        if(!DecompressXZFile(name, m_TempFilePath)) {
+            wxRemoveFile(m_TempFilePath);
+            return INIT_FAIL_REMOVE;
+        }
+    } else {
+        m_TempFilePath = name;
+        ext = wxFileName(name).GetExt();
+    }
+    m_FullPath = name;
+
     //    Use a static semaphore flag to prevent recursion
     if( s_bInS57 ) {
 //          printf("s57chart::Init() recursion..., retry\n");
@@ -2377,10 +3610,9 @@ InitReturn s57chart::Init( const wxString& name, ChartInitFlag flags )
 
     InitReturn ret_value = INIT_OK;
 
-    m_FullPath = name;
-    m_Description = m_FullPath;
+    m_Description = name;
 
-    wxFileName fn( name );
+    wxFileName fn( m_TempFilePath );
 
     //      Get the "Usage" character
     wxString cname = fn.GetName();
@@ -2417,14 +3649,17 @@ InitReturn s57chart::Init( const wxString& name, ChartInitFlag flags )
     }
 
     if( flags == HEADER_ONLY ) {
-        if( fn.GetExt() == _T("000") ) {
-            if( !GetBaseFileAttr( fn ) ) ret_value = INIT_FAIL_REMOVE;
-
-            if( !CreateHeaderDataFromENC() ) ret_value = INIT_FAIL_REMOVE;
-            else
-                ret_value = INIT_OK;
-        } else if( fn.GetExt() == _T("S57") ) {
-            m_SENCFileName = name;
+        if( ext == _T("000") ) {
+            if( !GetBaseFileAttr( fn.GetFullPath() ) )
+                ret_value = INIT_FAIL_REMOVE;
+            else {
+                if( !CreateHeaderDataFromENC() )
+                    ret_value = INIT_FAIL_REMOVE;
+                else
+                    ret_value = INIT_OK;
+            }
+        } else if( ext == _T("S57") ) {
+            m_SENCFileName = m_TempFilePath;
             if( !CreateHeaderDataFromSENC() ) ret_value = INIT_FAIL_REMOVE;
             else
                 ret_value = INIT_OK;
@@ -2438,16 +3673,17 @@ InitReturn s57chart::Init( const wxString& name, ChartInitFlag flags )
     //      Full initialization from here
 
     if( !m_bbase_file_attr_known ) {
-        if( !GetBaseFileAttr( fn ) ) ret_value = INIT_FAIL_REMOVE;
+        if( !GetBaseFileAttr( name ) )
+            ret_value = INIT_FAIL_REMOVE;
         else
             m_bbase_file_attr_known = true;
     }
 
-    if( fn.GetExt() == _T("000") ) {
+    if( ext == _T("000") ) {
         if( m_bbase_file_attr_known ) {
-            ::wxBeginBusyCursor();
+            OCPNPlatform::ShowBusySpinner();
 
-            int sret = FindOrCreateSenc( name );
+            int sret = FindOrCreateSenc( m_FullPath );
             if( sret != BUILD_SENC_OK ) {
                 if( sret == BUILD_SENC_NOK_RETRY ) ret_value = INIT_FAIL_RETRY;
                 else
@@ -2455,185 +3691,220 @@ InitReturn s57chart::Init( const wxString& name, ChartInitFlag flags )
             } else
                 ret_value = PostInit( flags, m_global_color_scheme );
 
-            ::wxEndBusyCursor();
         }
 
     }
 
-    else if( fn.GetExt() == _T("S57") ) {
-        ::wxBeginBusyCursor();
+    else if( ext == _T("S57") ) {
+        OCPNPlatform::ShowBusySpinner();
 
-        m_SENCFileName = name;
+        m_SENCFileName = m_TempFilePath;
         ret_value = PostInit( flags, m_global_color_scheme );
-
-        ::wxEndBusyCursor();
 
     }
 
+    OCPNPlatform::HideBusySpinner();
+    
     s_bInS57--;
     return ret_value;
 
+}
+
+wxString s57chart::buildSENCName( const wxString& name)
+{
+    wxFileName fn(name);
+    fn.SetExt( _T("S57") );
+    wxString file_name = fn.GetFullName();
+    
+    //      Set the proper directory for the SENC files
+    wxString SENCdir = g_SENCPrefix;
+    
+    if( SENCdir.Last() != wxFileName::GetPathSeparator() )
+        SENCdir.Append( wxFileName::GetPathSeparator() );
+    
+#if 1
+    wxString source_dir = fn.GetPath(wxPATH_GET_SEPARATOR);    
+    wxCharBuffer buf = source_dir.ToUTF8();
+    unsigned char sha1_out[20];
+    sha1( (unsigned char *) buf.data(), strlen(buf.data()), sha1_out );
+    
+    wxString sha1;
+    for (unsigned int i=0 ; i < 6 ; i++){
+        wxString s;
+        s.Printf(_T("%02X"), sha1_out[i]);
+        sha1 += s;
+    }
+    sha1 += _T("_");
+    file_name.Prepend(sha1);
+#endif    
+    
+    wxFileName tsfn( SENCdir );
+    tsfn.SetFullName( file_name );
+    
+    return tsfn.GetFullPath();
 }
 
 //-----------------------------------------------------------------------------------------------
 //    Find or Create a relevent SENC file from a given .000 ENC file
 //    Returns with error code, and associated SENC file name in m_S57FileName
 //-----------------------------------------------------------------------------------------------
-InitReturn s57chart::FindOrCreateSenc( const wxString& name )
+InitReturn s57chart::FindOrCreateSenc( const wxString& name, bool b_progress )
 {
+    //  This method may be called for a compressed .000 cell, so check and decompress if necessary
+    wxString ext;
+    if(name.Upper().EndsWith(".XZ")) {
+        ext = wxFileName(name.Left(name.Length()-3)).GetExt();
+        
+        // decompress to temp file to allow seeking
+        m_TempFilePath = wxFileName::GetTempDir() + wxFileName::GetPathSeparator() +
+        wxFileName(name).GetName();
+        
+        if(!DecompressXZFile(name, m_TempFilePath)) {
+            wxRemoveFile(m_TempFilePath);
+            return INIT_FAIL_REMOVE;
+        }
+    } else {
+        m_TempFilePath = name;
+        ext = wxFileName(name).GetExt();
+    }
+    m_FullPath = name;
+    
+    if( !m_bbase_file_attr_known ) {
+        if( !GetBaseFileAttr( m_TempFilePath ) )
+            return INIT_FAIL_REMOVE;
+        else
+            m_bbase_file_attr_known = true;
+    }
+    
     //      Establish location for SENC files
-    m_SENCFileName = name;
-    m_SENCFileName.SetExt( _T("S57") );
-
-    //      Set the proper directory for the SENC files
-    wxString SENCdir = g_SENCPrefix;
-
-    if( SENCdir.Last() != m_SENCFileName.GetPathSeparator() ) SENCdir.Append(
-            m_SENCFileName.GetPathSeparator() );
-
-    wxFileName tsfn( SENCdir );
-    tsfn.SetFullName( m_SENCFileName.GetFullName() );
-    m_SENCFileName = tsfn;
-
-    // Really can only Init and use S57 chart if the S52 Presentation Library is OK
-    if( !ps52plib->m_bOK ) return INIT_FAIL_REMOVE;
-
+    m_SENCFileName = buildSENCName( name );
+    
     int build_ret_val = 1;
 
     bool bbuild_new_senc = false;
     m_bneed_new_thumbnail = false;
 
-    wxFileName FileName000( name );
+    wxFileName FileName000( m_TempFilePath );
 
 //      Look for SENC file in the target directory
 
-    if( m_SENCFileName.FileExists() ) {
-        wxFile f;
-        if( f.Open( m_SENCFileName.GetFullPath() ) ) {
-            if( f.Length() == 0 ) {
-                f.Close();
-                build_ret_val = BuildSENCFile( name, m_SENCFileName.GetFullPath() );
-            } else                                      // file exists, non-zero
-            {                                         // so check for new updates
+    wxString msg( _T("S57chart::Checking SENC file: ") );
+    msg.Append( m_SENCFileName );
+    wxLogMessage( msg );
+    
+    {
+        int force_make_senc = 0;
 
-                f.Seek( 0 );
-                wxFileInputStream *pfpx_u = new wxFileInputStream( f );
-                wxBufferedInputStream *pfpx = new wxBufferedInputStream( *pfpx_u );
-                int dun = 0;
-                int last_update = 0;
-                int senc_file_version = 0;
-                int force_make_senc = 0;
-                char buf[256];
-                char *pbuf = buf;
-                wxDateTime ModTime000;
-                int size000 = 0;
-                wxString senc_base_edtn;
+        if( ::wxFileExists(m_SENCFileName) ){                    // SENC file exists
 
-                while( !dun ) {
-                    if( my_fgets( pbuf, 256, *pfpx ) == 0 ) {
-                        dun = 1;
-                        force_make_senc = 1;
-                        break;
-                    } else {
-                        if( !strncmp( pbuf, "OGRF", 4 ) ) {
-                            dun = 1;
-                            break;
-                        }
+            Osenc senc;
+            if(senc.ingestHeader( m_SENCFileName ) ){
+                bbuild_new_senc = true;
+                wxLogMessage(_T("    Rebuilding SENC due to ingestHeader failure."));
+            }
+            else{
 
-                        wxString str_buf( pbuf, wxConvUTF8 );
-                        wxStringTokenizer tkz( str_buf, _T("=") );
-                        wxString token = tkz.GetNextToken();
+                int senc_file_version = senc.getSencReadVersion();
 
-                        if( token.IsSameAs( _T("UPDT"), TRUE ) ) {
-                            int i;
-                            i = tkz.GetPosition();
-                            last_update = atoi( &pbuf[i] );
-                        }
+                int last_update = senc.getSENCReadLastUpdate();
 
-                        else if( token.IsSameAs( _T("SENC Version"), TRUE ) ) {
-                            int i;
-                            i = tkz.GetPosition();
-                            senc_file_version = atoi( &pbuf[i] );
-                        }
+                wxString str = senc.getSENCFileCreateDate();
+                wxDateTime SENCCreateDate;
+                SENCCreateDate.ParseFormat( str, _T("%Y%m%d"));
 
-                        else if( token.IsSameAs( _T("FILEMOD000"), TRUE ) ) {
-                            int i;
-                            i = tkz.GetPosition();
-                            wxString str( &pbuf[i], wxConvUTF8 );
-                            str.Trim();                               // gets rid of newline, etc...
-                            if( !ModTime000.ParseFormat( str,
-                                    _T("%Y%m%d")/*(const wxChar *)"%Y%m%d"*/) ) ModTime000.SetToCurrent();
-                            ModTime000.ResetTime();                   // to midnight
-                        }
+                if( SENCCreateDate.IsValid() )
+                    SENCCreateDate.ResetTime();                   // to midnight
 
-                        else if( token.IsSameAs( _T("FILESIZE000"), TRUE ) ) {
-                            int i;
-                            i = tkz.GetPosition();
-                            size000 = atoi( &pbuf[i] );
-                        }
+//                wxULongLong size000 = senc.getFileSize000();
+//                wxString ssize000 = senc.getsFileSize000();
 
-                        else if( token.IsSameAs( _T("EDTN000"), TRUE ) ) {
-                            int i;
-                            i = tkz.GetPosition();
-                            wxString str( &pbuf[i], wxConvUTF8 );
-                            str.Trim();                               // gets rid of newline, etc...
-                            senc_base_edtn = str;
-                        }
-
-                    }
-                }
-
-                delete pfpx;
-                delete pfpx_u;
-                f.Close();
+                wxString senc_base_edtn = senc.getSENCReadBaseEdition();
+                long isenc_edition;
+                senc_base_edtn.ToLong(&isenc_edition);
+                long ifile_edition;
+                m_edtn000.ToLong(&ifile_edition);
+                
 //              Anything to do?
-// force_make_senc = 1;
+//force_make_senc = 1;
                 //  SENC file version has to be correct for other tests to make sense
-                if( senc_file_version != CURRENT_SENC_FORMAT_VERSION ) bbuild_new_senc = true;
+                if( senc_file_version != CURRENT_SENC_FORMAT_VERSION ){
+                    bbuild_new_senc = true;
+                    wxLogMessage(_T("    Rebuilding SENC due to SENC format update."));
+                }
 
                 //  Senc EDTN must be the same as .000 file EDTN.
                 //  This test catches the usual case where the .000 file is updated from the web,
                 //  and all updates (.001, .002, etc.)  are subsumed.
-                else if( !senc_base_edtn.IsSameAs( m_edtn000 ) ) bbuild_new_senc = true;
-
+                
+                else if( ifile_edition > isenc_edition ){
+                    bbuild_new_senc = true;
+                    wxLogMessage(_T("    Rebuilding SENC due to cell edition update."));
+                    wxString msg;
+                    msg = _T("    Last edition recorded in SENC: ");
+                    msg += senc_base_edtn;
+                    msg += _T("  most recent edition cell file: ");
+                    msg += m_edtn000;
+                    wxLogMessage(msg);
+                }
                 else {
                     //    See if there are any new update files  in the ENC directory
-                    int most_recent_update_file = GetUpdateFileArray( FileName000, NULL );
+                    int most_recent_update_file = GetUpdateFileArray( FileName000, NULL, m_date000, m_edtn000 );
 
-                    if( last_update != most_recent_update_file ) bbuild_new_senc = true;
+                    if( ifile_edition == isenc_edition ){
+                        if( most_recent_update_file > last_update ){
+                            bbuild_new_senc = true;
+                            wxLogMessage(_T("    Rebuilding SENC due to incremental cell update."));
+                            wxString msg;
+                            msg.Printf(_T("    Last update recorded in SENC: %d   most recent update file: %d"), last_update, most_recent_update_file);
+                            wxLogMessage(msg);
+                        }
+                    }
 
-//          Make two simple tests to see if the .000 file is "newer" than the SENC file representation
+//          Make simple tests to see if the .000 file is "newer" than the SENC file representation
 //          These tests may be redundant, since the DSID:EDTN test above should catch new base files
                     wxDateTime OModTime000;
                     FileName000.GetTimes( NULL, &OModTime000, NULL );
                     OModTime000.ResetTime();                      // to midnight
-                    if( ModTime000.IsValid() ) if( OModTime000.IsLaterThan( ModTime000 ) ) bbuild_new_senc =
-                            true;
+                    if( SENCCreateDate.IsValid() ){
+                        if( OModTime000.IsLaterThan( SENCCreateDate ) ){
+                            wxLogMessage(_T("    Rebuilding SENC due to Senc vs cell file time check."));
+                            bbuild_new_senc = true;
+                        }
+                    }
+                    else{
+                        bbuild_new_senc = true;
+                        wxLogMessage(_T("    Rebuilding SENC due to SENC create time invalid."));
+                    }
 
-                    int Osize000l = FileName000.GetSize().GetLo();
-                    if( size000 != Osize000l ) bbuild_new_senc = true;
+
+//                     int Osize000l = FileName000.GetSize().GetLo();
+//                     int Osize000h = FileName000.GetSize().GetHi();
+//                     wxString t;
+//                     t.Printf(_T("%d%d"), Osize000h, Osize000l);
+//                     if( !t.IsSameAs( ssize000) )
+//                         bbuild_new_senc = true;
+
                 }
 
-                if( force_make_senc ) bbuild_new_senc = true;
-
-                if( bbuild_new_senc ) build_ret_val = BuildSENCFile( name,
-                        m_SENCFileName.GetFullPath() );
+                if( force_make_senc )
+                    bbuild_new_senc = true;
 
             }
         }
+        else if( !::wxFileExists(m_SENCFileName ) )                    // SENC file does not exist
+        {
+            wxLogMessage(_T("    Rebuilding SENC due to missing SENC file."));
+            bbuild_new_senc = true;
+        }
     }
-
-    else                    // SENC file does not exist
-    {
-        build_ret_val = BuildSENCFile( name, m_SENCFileName.GetFullPath() );
-        bbuild_new_senc = true;
-    }
-
-    if( bbuild_new_senc ) m_bneed_new_thumbnail = true; // force a new thumbnail to be built in PostInit()
 
     if( bbuild_new_senc ) {
-        if( BUILD_SENC_NOK_PERMANENT == build_ret_val ) return INIT_FAIL_REMOVE;
-        if( BUILD_SENC_NOK_RETRY == build_ret_val ) return INIT_FAIL_RETRY;
+        m_bneed_new_thumbnail = true; // force a new thumbnail to be built in PostInit()
+        build_ret_val = BuildSENCFile( m_TempFilePath, m_SENCFileName, b_progress );
+        if( BUILD_SENC_NOK_PERMANENT == build_ret_val ) 
+            return INIT_FAIL_REMOVE;
+        if( BUILD_SENC_NOK_RETRY == build_ret_val )
+            return INIT_FAIL_RETRY;
     }
 
     return INIT_OK;
@@ -2643,9 +3914,9 @@ InitReturn s57chart::PostInit( ChartInitFlag flags, ColorScheme cs )
 {
 
 //    SENC file is ready, so build the RAZ structure
-    if( 0 != BuildRAZFromSENCFile( m_SENCFileName.GetFullPath() ) ) {
+    if( 0 != BuildRAZFromSENCFile( m_SENCFileName ) ) {
         wxString msg( _T("   Cannot load SENC file ") );
-        msg.Append( m_SENCFileName.GetFullPath() );
+        msg.Append( m_SENCFileName );
         wxLogMessage( msg );
 
         return INIT_FAIL_RETRY;
@@ -2653,15 +3924,15 @@ InitReturn s57chart::PostInit( ChartInitFlag flags, ColorScheme cs )
 
 //      Check for and if necessary rebuild Thumbnail
 //      Going to be in the global (user) SENC file directory
-
+#if 0
     wxString SENCdir = g_SENCPrefix;
-    if( SENCdir.Last() != m_SENCFileName.GetPathSeparator() ) SENCdir.Append(
-            m_SENCFileName.GetPathSeparator() );
+    if( SENCdir.Last() != m_SENCFileName.GetPathSeparator() )
+        SENCdir.Append( m_SENCFileName.GetPathSeparator() );
 
     wxFileName ThumbFileName( SENCdir, m_SENCFileName.GetName(), _T("BMP") );
 
-    if( !ThumbFileName.FileExists() || m_bneed_new_thumbnail ) BuildThumbnail(
-            ThumbFileName.GetFullPath() );
+    if( !ThumbFileName.FileExists() || m_bneed_new_thumbnail )
+        BuildThumbnail( ThumbFileName.GetFullPath() );
 
 //  Update the member thumbdata structure
     if( ThumbFileName.FileExists() ) {
@@ -2678,6 +3949,7 @@ InitReturn s57chart::PostInit( ChartInitFlag flags, ColorScheme cs )
 //                    pThumbData->pDIBThumb = pBMP_NEW;
         }
     }
+#endif
 
 //    Set the color scheme
     m_global_color_scheme = cs;
@@ -2691,6 +3963,17 @@ InitReturn s57chart::PostInit( ChartInitFlag flags, ColorScheme cs )
     return INIT_OK;
 }
 
+void s57chart::ClearDepthContourArray( void )
+{
+
+    if( m_nvaldco_alloc ) {
+        free (m_pvaldco_array);
+    }
+    m_nvaldco_alloc = 5;
+    m_nvaldco = 0;
+    m_pvaldco_array = (double *) calloc( m_nvaldco_alloc, sizeof(double) );
+}
+
 void s57chart::BuildDepthContourArray( void )
 {
     //    Build array of contour values for later use by conditional symbology
@@ -2701,6 +3984,10 @@ void s57chart::BuildDepthContourArray( void )
     }
 
     ObjRazRules *top;
+    // some ENC have a lot of DEPCNT objects but they seem to store them
+    // in VALDCO order, try to take advantage of that.
+    double prev_valdco = 0.0;
+
     for( int i = 0; i < PRIO_NUM; ++i ) {
         for( int j = 0; j < LUPNAME_NUM; j++ ) {
 
@@ -2709,14 +3996,17 @@ void s57chart::BuildDepthContourArray( void )
                 if( !strncmp( top->obj->FeatureName, "DEPCNT", 6 ) ) {
                     double valdco = 0.0;
                     if( GetDoubleAttr( top->obj, "VALDCO", valdco ) ) {
-                        m_nvaldco++;
-                        if( m_nvaldco > m_nvaldco_alloc ) {
-                            void *tr = realloc( (void *) m_pvaldco_array,
-                                    m_nvaldco_alloc * 2 * sizeof(double) );
-                            m_pvaldco_array = (double *) tr;
-                            m_nvaldco_alloc *= 2;
+                        if (valdco != prev_valdco) {
+                            prev_valdco = valdco;
+                            m_nvaldco++;
+                            if( m_nvaldco > m_nvaldco_alloc ) {
+                                void *tr = realloc( (void *) m_pvaldco_array,
+                                        m_nvaldco_alloc * 2 * sizeof(double) );
+                                m_pvaldco_array = (double *) tr;
+                                m_nvaldco_alloc *= 2;
+                            }
+                            m_pvaldco_array[m_nvaldco - 1] = valdco;
                         }
-                        m_pvaldco_array[m_nvaldco - 1] = valdco;
                     }
                 }
                 ObjRazRules *nxx = top->next;
@@ -2724,31 +4014,35 @@ void s57chart::BuildDepthContourArray( void )
             }
         }
     }
-
-    /*
-     //      And bubble sort it
-     bool swap = true;
-     int isort;
-
-     while(swap == true)
-     {
-     swap = false;
-     isort = 0;
-     while(isort < m_nvaldco - 1)
-     {
-     if(m_pvaldco_array[isort+1] < m_pvaldco_array[isort])
-     {
-     double t = m_pvaldco_array[isort];
-     m_pvaldco_array[isort] = m_pvaldco_array[isort+1];
-     m_pvaldco_array[isort+1] = t;
-     swap = true;
-     }
-     isort++;
-     }
-     }
-     */
     std::sort( m_pvaldco_array, m_pvaldco_array + m_nvaldco );
+    SetSafetyContour();
+}
 
+
+void s57chart::SetSafetyContour(void)
+{
+    // Iterate through the array of contours in this cell, choosing the best one to
+    // render as a bold "safety contour" in the PLIB.
+
+    //    This method computes the smallest chart DEPCNT:VALDCO value which
+    //    is greater than or equal to the current PLIB mariner parameter S52_MAR_SAFETY_CONTOUR
+
+    double mar_safety_contour = S52_getMarinerParam(S52_MAR_SAFETY_CONTOUR);
+
+    int i = 0;
+    if( NULL != m_pvaldco_array ) {
+        for( i = 0; i < m_nvaldco; i++ ) {
+            if( m_pvaldco_array[i] >= mar_safety_contour )
+                break;
+        }
+
+        if( i < m_nvaldco )
+            m_next_safe_cnt = m_pvaldco_array[i];
+        else
+            m_next_safe_cnt = (double) 1e6;
+     } else {
+         m_next_safe_cnt = (double) 1e6;
+     }
 }
 
 void s57chart::InvalidateCache()
@@ -2787,8 +4081,10 @@ bool s57chart::BuildThumbnail( const wxString &bmpname )
     vp.pix_height = S57_THUMB_SIZE;
     vp.pix_width = S57_THUMB_SIZE;
 
-    vp.GetBBox().SetMin( m_FullExtent.WLON, m_FullExtent.SLAT );
-    vp.GetBBox().SetMax( m_FullExtent.ELON, m_FullExtent.NLAT );
+    vp.m_projection_type = PROJECTION_MERCATOR;
+
+    vp.GetBBox().Set( m_FullExtent.SLAT, m_FullExtent.WLON,
+                      m_FullExtent.NLAT, m_FullExtent.ELON );
 
     vp.chart_scale = 10000000 - 1;
     vp.Validate();
@@ -2819,6 +4115,9 @@ bool s57chart::BuildThumbnail( const wxString &bmpname )
 //      Also, save some other settings
     bool bsavem_bShowSoundgp = ps52plib->m_bShowSoundg;
 
+    // SetDisplayCategory may clear Noshow array
+    ps52plib->SaveObjNoshow();
+
 //      Now, set up what I want for this render
     for( iPtr = 0; iPtr < OBJLCount; iPtr++ ) {
         pOLE = (OBJLElement *) ( ps52plib->pOBJLArray->Item( iPtr ) );
@@ -2829,8 +4128,8 @@ bool s57chart::BuildThumbnail( const wxString &bmpname )
     ps52plib->m_bShowSoundg = false;
 
 //      Use display category MARINERS_STANDARD to force use of OBJLArray
-    DisCat dsave = ps52plib->m_nDisplayCategory;
-    ps52plib->m_nDisplayCategory = MARINERS_STANDARD;
+    DisCat dsave = ps52plib->GetDisplayCategory();
+    ps52plib->SetDisplayCategory( MARINERS_STANDARD );
 
 #ifdef ocpnUSE_DIBSECTION
     ocpnMemDC memdc, dc_org;
@@ -2854,7 +4153,9 @@ bool s57chart::BuildThumbnail( const wxString &bmpname )
         pOLE->nViz = *psvr++;
     }
 
-    ps52plib->m_nDisplayCategory = dsave;
+    ps52plib->SetDisplayCategory(dsave);
+    ps52plib->RestoreObjNoshow();
+
     ps52plib->m_bShowSoundg = bsavem_bShowSoundgp;
 
 //      Reset the color scheme
@@ -2887,14 +4188,14 @@ bool s57chart::BuildThumbnail( const wxString &bmpname )
 }
 
 #include <wx/arrimpl.cpp>
-WX_DEFINE_ARRAY( float*, MyFloatPtrArray );
+WX_DEFINE_ARRAY_PTR( float*, MyFloatPtrArray );
 
 //    Read the .000 ENC file and create required Chartbase data structures
 bool s57chart::CreateHeaderDataFromENC( void )
 {
-    if( !InitENCMinimal( m_FullPath ) ) {
+    if( !InitENCMinimal( m_TempFilePath ) ) {
         wxString msg( _T("   Cannot initialize ENC file ") );
-        msg.Append( m_FullPath );
+        msg.Append( m_TempFilePath );
         wxLogMessage( msg );
 
         return false;
@@ -2922,7 +4223,6 @@ bool s57chart::CreateHeaderDataFromENC( void )
     pFeat = GetChartFirstM_COVR( catcov );
 
     while( pFeat ) {
-
                 //    Get the next M_COVR feature, and create possible additional entries for COVR
                 OGRPolygon *poly = (OGRPolygon *) ( pFeat->GetGeometryRef() );
                 OGRLinearRing *xring = poly->getExteriorRing();
@@ -2951,89 +4251,74 @@ bool s57chart::CreateHeaderDataFromENC( void )
 
                         pfr += 2;
                     }
+
+                    if( catcov == 1 ) {
+                        pAuxPtrArray->Add( pf );
+                        pAuxCntArray->Add( npt );
+                    }
+                    else if( catcov == 2 ){
+                        pNoCovrPtrArray->Add( pf );
+                        pNoCovrCntArray->Add( npt );
+                    }
                 }
 
+
             delete pFeat;
-
-            if( catcov == 1 ) {
-                pAuxPtrArray->Add( pf );
-                pAuxCntArray->Add( npt );
-            }
-            else if( catcov == 2 ){
-                pNoCovrPtrArray->Add( pf );
-                pNoCovrCntArray->Add( npt );
-            }
-
             pFeat = GetChartNextM_COVR( catcov );
-        }         // while
+    }         // while
 
-        //    Allocate the storage
+    //    Allocate the storage
 
-        m_nCOVREntries = pAuxCntArray->GetCount();
+    m_nCOVREntries = pAuxCntArray->GetCount();
 
-        //    If only one M_COVR,CATCOV=1 object was found,
-        //    assign the geometry to the one and only COVR
+    //    Create new COVR entries
 
-        if( m_nCOVREntries == 1 ) {
-            m_pCOVRTablePoints = (int *) malloc( sizeof(int) );
-            *m_pCOVRTablePoints = pAuxCntArray->Item( 0 );
-            m_pCOVRTable = (float **) malloc( sizeof(float *) );
-            *m_pCOVRTable = (float *) malloc( pAuxCntArray->Item( 0 ) * 2 * sizeof(float) );
-            memcpy( *m_pCOVRTable, pAuxPtrArray->Item( 0 ),
-                    pAuxCntArray->Item( 0 ) * 2 * sizeof(float) );
+    if( m_nCOVREntries >= 1 ) {
+        m_pCOVRTablePoints = (int *) malloc( m_nCOVREntries * sizeof(int) );
+        m_pCOVRTable = (float **) malloc( m_nCOVREntries * sizeof(float *) );
+
+        for( unsigned int j = 0; j < (unsigned int) m_nCOVREntries; j++ ) {
+            m_pCOVRTablePoints[j] = pAuxCntArray->Item( j );
+            m_pCOVRTable[j] = pAuxPtrArray->Item( j );
         }
+    }
 
-        else if( m_nCOVREntries > 1 ) {
-            //    Create new COVR entries
-            m_pCOVRTablePoints = (int *) malloc( m_nCOVREntries * sizeof(int) );
-            m_pCOVRTable = (float **) malloc( m_nCOVREntries * sizeof(float *) );
+    else                                     // strange case, found no CATCOV=1 M_COVR objects
+    {
+        wxString msg( _T("   ENC contains no useable M_COVR, CATCOV=1 features:  ") );
+        msg.Append( m_TempFilePath );
+        wxLogMessage( msg );
+    }
 
-            for( unsigned int j = 0; j < (unsigned int) m_nCOVREntries; j++ ) {
-                m_pCOVRTablePoints[j] = pAuxCntArray->Item( j );
-                m_pCOVRTable[j] = (float *) malloc( pAuxCntArray->Item( j ) * 2 * sizeof(float) );
-                memcpy( m_pCOVRTable[j], pAuxPtrArray->Item( j ),
-                        pAuxCntArray->Item( j ) * 2 * sizeof(float) );
-            }
+
+    //      And for the NoCovr regions
+    m_nNoCOVREntries = pNoCovrCntArray->GetCount();
+
+    if( m_nNoCOVREntries ) {
+        //    Create new NoCOVR entries
+        m_pNoCOVRTablePoints = (int *) malloc( m_nNoCOVREntries * sizeof(int) );
+        m_pNoCOVRTable = (float **) malloc( m_nNoCOVREntries * sizeof(float *) );
+
+        for( unsigned int j = 0; j < (unsigned int) m_nNoCOVREntries; j++ ) {
+            int npoints = pNoCovrCntArray->Item( j );
+            m_pNoCOVRTablePoints[j] = npoints;
+            m_pNoCOVRTable[j] = pNoCovrPtrArray->Item( j );
         }
+    }
+    else {
+        m_pNoCOVRTablePoints = NULL;
+        m_pNoCOVRTable = NULL;
+    }
 
-        else                                     // strange case, found no CATCOV=1 M_COVR objects
-        {
-            wxString msg( _T("   ENC contains no useable M_COVR, CATCOV=1 features:  ") );
-            msg.Append( m_FullPath );
-            wxLogMessage( msg );
-        }
-
-
-        //      And for the NoCovr regions
-        m_nNoCOVREntries = pNoCovrCntArray->GetCount();
-
-        if( m_nNoCOVREntries ) {
-            //    Create new NoCOVR entries
-            m_pNoCOVRTablePoints = (int *) malloc( m_nNoCOVREntries * sizeof(int) );
-            m_pNoCOVRTable = (float **) malloc( m_nNoCOVREntries * sizeof(float *) );
-
-            for( unsigned int j = 0; j < (unsigned int) m_nNoCOVREntries; j++ ) {
-                int npoints = pNoCovrCntArray->Item( j );
-                m_pNoCOVRTablePoints[j] = npoints;
-                m_pNoCOVRTable[j] = (float *) malloc( npoints * 2 * sizeof(float) );
-                memcpy( m_pNoCOVRTable[j], pNoCovrPtrArray->Item( j ),
-                        npoints * 2 * sizeof(float) );
-            }
-        }
-        else {
-            m_pNoCOVRTablePoints = NULL;
-            m_pNoCOVRTable = NULL;
-        }
-
-        delete pAuxPtrArray;
-        delete pAuxCntArray;
-        delete pNoCovrPtrArray;
-        delete pNoCovrCntArray;
+    delete pAuxPtrArray;
+    delete pAuxCntArray;
+    delete pNoCovrPtrArray;
+    delete pNoCovrCntArray;
 
 
     if( 0 == m_nCOVREntries ) {                        // fallback
         wxString msg( _T("   ENC contains no M_COVR features:  ") );
-        msg.Append( m_FullPath );
+        msg.Append( m_TempFilePath );
         wxLogMessage( msg );
 
         msg =  _T("   Calculating Chart Extents as fallback.");
@@ -3073,7 +4358,7 @@ bool s57chart::CreateHeaderDataFromENC( void )
 
         } else {
             wxString msg( _T("   Cannot calculate Extents for ENC:  ") );
-            msg.Append( m_FullPath );
+            msg.Append( m_TempFilePath );
             wxLogMessage( msg );
 
             return false;                     // chart is completely unusable
@@ -3091,147 +4376,128 @@ bool s57chart::CreateHeaderDataFromENC( void )
     m_Chart_Scale = GetENCScale();
 
     wxString nice_name;
-    GetChartNameFromTXT( m_FullPath, nice_name );
+    GetChartNameFromTXT( m_TempFilePath, nice_name );
     m_Name = nice_name;
 
 
     return true;
 }
 
+//    Read the .S57 oSENC file (CURRENT_SENC_FORMAT_VERSION >= 200) and create required Chartbase data structures
+bool s57chart::CreateHeaderDataFromoSENC( void )
+{
+    bool ret_val = true;
+
+    wxFFileInputStream fpx( m_SENCFileName );
+    if (!fpx.IsOk()) {
+        if( !::wxFileExists(m_SENCFileName) ) {
+            wxString msg( _T("   Cannot open SENC file ") );
+            msg.Append( m_SENCFileName );
+            wxLogMessage( msg );
+
+        }
+        return false;
+    }
+
+    Osenc senc;
+    if(senc.ingestHeader( m_SENCFileName ) ){
+        return false;
+    }
+    else{
+
+        // Get Chartbase member elements from the oSENC file records in the header
+
+        // Scale
+        m_Chart_Scale = senc.getSENCReadScale();
+
+        // Nice Name
+        m_Name = senc.getReadName();
+
+        // ID
+        m_ID = senc.getReadID();
+
+        // Extents
+        Extent &ext = senc.getReadExtent();
+
+        m_FullExtent.ELON = ext.ELON;
+        m_FullExtent.WLON = ext.WLON;
+        m_FullExtent.NLAT = ext.NLAT;
+        m_FullExtent.SLAT = ext.SLAT;
+        m_bExtentSet = true;
+
+
+        //Coverage areas
+        SENCFloatPtrArray &AuxPtrArray = senc.getSENCReadAuxPointArray();
+        wxArrayInt &AuxCntArray = senc.getSENCReadAuxPointCountArray();
+
+        m_nCOVREntries = AuxCntArray.GetCount();
+
+        m_pCOVRTablePoints = (int *) malloc( m_nCOVREntries * sizeof(int) );
+        m_pCOVRTable = (float **) malloc( m_nCOVREntries * sizeof(float *) );
+
+        for( unsigned int j = 0; j < (unsigned int) m_nCOVREntries; j++ ) {
+            m_pCOVRTablePoints[j] = AuxCntArray.Item( j );
+            m_pCOVRTable[j] = (float *) malloc( AuxCntArray.Item( j ) * 2 * sizeof(float) );
+            memcpy( m_pCOVRTable[j], AuxPtrArray.Item( j ),
+                    AuxCntArray.Item( j ) * 2 * sizeof(float) );
+        }
+
+        // NoCoverage areas
+        SENCFloatPtrArray &NoCovrPtrArray = senc.getSENCReadNOCOVRPointArray();
+        wxArrayInt &NoCovrCntArray = senc.getSENCReadNOCOVRPointCountArray();
+
+        m_nNoCOVREntries = NoCovrCntArray.GetCount();
+
+        if( m_nNoCOVREntries ) {
+            //    Create new NoCOVR entries
+            m_pNoCOVRTablePoints = (int *) malloc( m_nNoCOVREntries * sizeof(int) );
+            m_pNoCOVRTable = (float **) malloc( m_nNoCOVREntries * sizeof(float *) );
+
+            for( unsigned int j = 0; j < (unsigned int) m_nNoCOVREntries; j++ ) {
+                int npoints = NoCovrCntArray.Item( j );
+                m_pNoCOVRTablePoints[j] = npoints;
+                m_pNoCOVRTable[j] = (float *) malloc( npoints * 2 * sizeof(float) );
+                memcpy( m_pNoCOVRTable[j], NoCovrPtrArray.Item( j ),
+                        npoints * 2 * sizeof(float) );
+            }
+        }
+
+
+        //  Misc
+        m_SE = m_edtn000;
+        m_datum_str = _T("WGS84");
+        m_SoundingsDatum = _T("MEAN LOWER LOW WATER");
+
+
+        int senc_file_version = senc.getSencReadVersion();
+
+        int last_update = senc.getSENCReadLastUpdate();
+
+        wxString str = senc.getSENCFileCreateDate();
+        wxDateTime SENCCreateDate;
+        SENCCreateDate.ParseFormat( str, _T("%Y%m%d"));
+
+        if( SENCCreateDate.IsValid() )
+            SENCCreateDate.ResetTime();                   // to midnight
+
+         wxString senc_base_edtn = senc.getSENCReadBaseEdition();
+    }
+
+    return ret_val;
+}
+
+
+
 //    Read the .S57 SENC file and create required Chartbase data structures
 bool s57chart::CreateHeaderDataFromSENC( void )
 {
     bool ret_val = true;
-    //    Sanity check for existence of file
+    if(CURRENT_SENC_FORMAT_VERSION >= 200)
+        return CreateHeaderDataFromoSENC();
 
-    if( !m_SENCFileName.FileExists() ) {
-        wxString msg( _T("   Cannot open SENC file ") );
-        msg.Append( m_SENCFileName.GetFullPath() );
-        wxLogMessage( msg );
-
-        return 1;
-    }
-
-    wxString ifs( m_SENCFileName.GetFullPath() );
-
-    wxFileInputStream fpx_u( ifs );
-    wxBufferedInputStream fpx( fpx_u );
-
-    int MAX_LINE = 499999;
-    char *buf = (char *) malloc( MAX_LINE + 1 );
-
-    int dun = 0;
-
-    hdr_buf = (char *) malloc( 1 );
-    wxString date_000, date_upd;
-
-    while( !dun ) {
-
-        if( my_fgets( buf, MAX_LINE, fpx ) == 0 ) {
-            dun = 1;
-            break;
-        }
-
-        if( !strncmp( buf, "OGRF", 4 ) ) {
-            dun = 1;
-            break;
-        }               //OGRF
-
-        else if( !strncmp( buf, "SENC", 4 ) ) {
-            int senc_file_version;
-            sscanf( buf, "SENC Version=%i", &senc_file_version );
-            if( senc_file_version != CURRENT_SENC_FORMAT_VERSION ) {
-                wxString msg( _T("   Wrong version on SENC file ") );
-                msg.Append( m_SENCFileName.GetFullPath() );
-                wxLogMessage( msg );
-
-                dun = 1;
-                ret_val = false;                   // error
-                break;
-            }
-        }
-
-        else if( !strncmp( buf, "DATEUPD", 7 ) ) {
-            date_upd.Append( wxString( &buf[8], wxConvUTF8 ).BeforeFirst( '\n' ) );
-        }
-
-        else if( !strncmp( buf, "DATE000", 7 ) ) {
-            date_000.Append( wxString( &buf[8], wxConvUTF8 ).BeforeFirst( '\n' ) );
-        }
-
-        else if( !strncmp( buf, "SCALE", 5 ) ) {
-            int ins;
-            sscanf( buf, "SCALE=%d", &ins );
-            m_Chart_Scale = ins;
-
-        }
-
-        else if( !strncmp( buf, "NAME", 4 ) ) {
-            m_Name = wxString( &buf[5], wxConvUTF8 ).BeforeFirst( '\n' );
-        }
-
-        else if( !strncmp( buf, "Chart Extents:", 14 ) ) {
-            float elon, wlon, nlat, slat;
-            sscanf( buf, "Chart Extents: %g %g %g %g", &elon, &wlon, &nlat, &slat );
-            m_FullExtent.ELON = elon;
-            m_FullExtent.WLON = wlon;
-            m_FullExtent.NLAT = nlat;
-            m_FullExtent.SLAT = slat;
-            m_bExtentSet = true;
-        }
-
-    }                       //while(!dun)
-
-    //    Populate COVR structures
-    if( m_bExtentSet ) {
-        m_nCOVREntries = 1;                       // this is the default for pre-made SENCs
-
-        if( m_nCOVREntries == 1 ) {
-            m_pCOVRTablePoints = (int *) malloc( sizeof(int) );
-            *m_pCOVRTablePoints = 4;
-            m_pCOVRTable = (float **) malloc( sizeof(float *) );
-
-            float *pf = (float *) malloc( 2 * 4 * sizeof(float) );
-            *m_pCOVRTable = pf;
-            float *pfe = pf;
-
-            *pfe++ = m_FullExtent.NLAT;
-            *pfe++ = m_FullExtent.ELON;
-
-            *pfe++ = m_FullExtent.NLAT;
-            *pfe++ = m_FullExtent.WLON;
-
-            *pfe++ = m_FullExtent.SLAT;
-            *pfe++ = m_FullExtent.WLON;
-
-            *pfe++ = m_FullExtent.SLAT;
-            *pfe++ = m_FullExtent.ELON;
-        }
-    }
-
-    free( buf );
-
-    free( hdr_buf );
-
-    //   Decide on pub date to show
-
-    int d000 = atoi(
-            ( date_000/*(wxString((const wchar_t *)date_000, wxConvUTF8)*/.Mid( 0, 4 ) ).mb_str() );
-    int dupd = atoi(
-            ( date_upd/*(wxString((const wchar_t *)date_upd, wxConvUTF8)*/.Mid( 0, 4 ) ).mb_str() );
-
-    if( dupd > d000 ) m_PubYear = date_upd/*wxString((const wchar_t *)date_upd, wxConvUTF8)*/.Mid(
-            0, 4 );
-    else
-        m_PubYear = date_000/*wxString((const wchar_t *)date_000, wxConvUTF8)*/.Mid( 0, 4 );
-
-    wxDateTime dt;
-    dt.ParseDate( date_000 );
-
-    if( !ret_val ) return false;
-
-    return true;
-}
+    return false;
+    
+ }
 
 /*    This method returns the smallest chart DEPCNT:VALDCO value which
  is greater than or equal to the specified value
@@ -3278,39 +4544,21 @@ ListOfS57Obj *s57chart::GetAssociatedObjects( S57Obj *obj )
 
     switch( obj->Primitive_type ){
         case GEO_POINT:
+            //  n.b.  This logic not perfectly right for LINE and AREA features
+            //  It uses the object reference point for testing, instead of the decomposed
+            //  line or boundary geometry.  Thus, it may fail on some intersecting relationships.
+            //  Judged acceptable, in favor of performance implications.
+            //  DSR
+        case GEO_LINE:
+        case GEO_AREA:
             ObjRazRules *top;
             disPrioIdx = 1;         // PRIO_GROUP1:S57 group 1 filled areas
-
-            /*
-             for(j=0 ; j<LUPNAME_NUM ; j++)
-             {
-             top = razRules[disPrioIdx][j];
-             while ( top != NULL)
-             {
-             //                              if(!strncmp(top->obj->FeatureName, "DEPARE", 6) || !strncmp(top->obj->FeatureName, "DRGARE", 6))
-             if(top->obj->bIsAssociable)
-             {
-             if(top->obj->BBObj.PointInBox( lon, lat, 0.0))
-             {
-             if(IsPointInObjArea(lat, lon, 0.0, top->obj))
-             {
-             pobj_list->Append(top->obj);
-             break;
-             }
-             }
-             }
-
-             ObjRazRules *nxx  = top->next;
-             top = nxx;
-             }
-             }
-             */
 
             gotit = false;
             top = razRules[disPrioIdx][3];     // PLAIN_BOUNDARIES
             while( top != NULL ) {
                 if( top->obj->bIsAssociable ) {
-                    if( top->obj->BBObj.PointInBox( lon, lat, 0.0 ) ) {
+                    if( top->obj->BBObj.Contains( lat, lon ) ) {
                         if( IsPointInObjArea( lat, lon, 0.0, top->obj ) ) {
                             pobj_list->Append( top->obj );
                             gotit = true;
@@ -3327,7 +4575,7 @@ ListOfS57Obj *s57chart::GetAssociatedObjects( S57Obj *obj )
                 top = razRules[disPrioIdx][4];     // SYMBOLIZED_BOUNDARIES
                 while( top != NULL ) {
                     if( top->obj->bIsAssociable ) {
-                        if( top->obj->BBObj.PointInBox( lon, lat, 0.0 ) ) {
+                        if( top->obj->BBObj.Contains( lat, lon ) ) {
                             if( IsPointInObjArea( lat, lon, 0.0, top->obj ) ) {
                                 pobj_list->Append( top->obj );
                                 break;
@@ -3340,12 +4588,6 @@ ListOfS57Obj *s57chart::GetAssociatedObjects( S57Obj *obj )
                 }
             }
 
-            break;
-
-        case GEO_LINE:
-            break;
-
-        case GEO_AREA:
             break;
 
         default:
@@ -3387,7 +4629,10 @@ void s57chart::GetChartNameFromTXT( const wxString& FullPath, wxString &Name )
             //  Suppress log messages on bad file reads
             {
                 wxLogNull logNo;
-                if( !text_file.Open() ) file_ok = false;
+                if( !text_file.Open() ) {
+                    if( !text_file.Open(wxConvISO8859_1) )
+                        file_ok = false;
+                }
             }
 
             if( file_ok ) {
@@ -3443,8 +4688,12 @@ static int ExtensionCompare( const wxString& first, const wxString& second )
     return ext1.Cmp( ext2 );
 }
 
-int s57chart::GetUpdateFileArray( const wxFileName file000, wxArrayString *UpFiles )
+
+
+int s57chart::GetUpdateFileArray( const wxFileName file000, wxArrayString *UpFiles,
+                                  wxDateTime date000, wxString edtn000)
 {
+
     wxString DirName000 = file000.GetPath( (int) ( wxPATH_GET_SEPARATOR | wxPATH_GET_VOLUME ) );
     wxDir dir( DirName000 );
     wxString ext;
@@ -3468,8 +4717,10 @@ int s57chart::GetUpdateFileArray( const wxFileName file000, wxArrayString *UpFil
             wxString FileToAdd( DirName000 );
             FileToAdd.Append( file.GetFullName() );
 
-            if( !filename.IsSameAs( _T("CATALOG.031"), false ) )           // don't process catalogs
-                    {
+            wxCharBuffer buffer=FileToAdd.ToUTF8();             // Check file namme for convertability
+
+            if( buffer.data() && !filename.IsSameAs( _T("CATALOG.031"), false ) )           // don't process catalogs
+            {
 //          We must check the update file for validity
 //          1.  Is update field DSID:EDTN  equal to base .000 file DSID:EDTN?
 //          2.  Is update file DSID.ISDT greater than or equal to base .000 file DSID:ISDT
@@ -3528,11 +4779,11 @@ int s57chart::GetUpdateFileArray( const wxFileName file000, wxArrayString *UpFil
 
                         umedtn = _T("1");                // backstop
                     }
-
-                    delete poModule;
                 }
 
-                if( ( !umdate.IsEarlierThan( m_date000 ) ) && ( umedtn.IsSameAs( m_edtn000 ) ) ) // Note polarity on Date compare....
+                delete poModule;
+
+                if( ( !umdate.IsEarlierThan( date000 ) ) && ( umedtn.IsSameAs( edtn000 ) ) ) // Note polarity on Date compare....
                 dummy_array->Add( FileToAdd );                    // Looking for umdate >= m_date000
             }
         }
@@ -3548,13 +4799,17 @@ int s57chart::GetUpdateFileArray( const wxFileName file000, wxArrayString *UpFil
         wxString Last = dummy_array->Last();
         wxFileName fnl( Last );
         ext = fnl.GetExt();
-        retval = atoi( ext.mb_str() );
+        wxCharBuffer buffer=ext.ToUTF8();
+        if(buffer.data())
+            retval = atoi( buffer.data() );
     }
 
     if( UpFiles == NULL ) delete dummy_array;
 
     return retval;
 }
+
+
 
 int s57chart::ValidateAndCountUpdates( const wxFileName file000, const wxString CopyDir,
         wxString &LastUpdateDate, bool b_copyfiles )
@@ -3565,7 +4820,7 @@ int s57chart::ValidateAndCountUpdates( const wxFileName file000, const wxString 
     //       wxString DirName000 = file000.GetPath((int)(wxPATH_GET_SEPARATOR | wxPATH_GET_VOLUME));
     //       wxDir dir(DirName000);
     wxArrayString *UpFiles = new wxArrayString;
-    retval = GetUpdateFileArray( file000, UpFiles );
+    retval = GetUpdateFileArray( file000, UpFiles, m_date000, m_edtn000);
 
     if( UpFiles->GetCount() ) {
         //      The s57reader of ogr requires that update set be sequentially complete
@@ -3579,11 +4834,13 @@ int s57chart::ValidateAndCountUpdates( const wxFileName file000, const wxString 
         //      ogr file open/ingest.  Delete after SENC file create finishes.
         //      Set starts with .000, which has the effect of copying the base file to the working dir
 
+        bool chain_broken_mssage_shown = false;
+
         if( b_copyfiles ) {
             m_tmpup_array = new wxArrayString;       // save a list of created files for later erase
 
             for( int iff = 0; iff < retval + 1; iff++ ) {
-                wxFileName ufile( m_FullPath );
+                wxFileName ufile( m_TempFilePath );
                 wxString sext;
                 sext.Printf( _T("%03d"), iff );
                 ufile.SetExt( sext );
@@ -3620,6 +4877,20 @@ int s57chart::ValidateAndCountUpdates( const wxFileName file000, const wxString 
 
                 else {
                     // Create a dummy ISO8211 file with no real content
+                    // Correct this.  We should break the walk, and notify the user  See FS#1406
+
+                    if( !chain_broken_mssage_shown ){
+                        OCPNMessageBox(NULL,
+                        _("S57 Cell Update chain incomplete.\nENC features may be incomplete or inaccurate.\nCheck the logfile for details."),
+                        _("OpenCPN Create SENC Warning"), wxOK | wxICON_EXCLAMATION, 30 );
+                        chain_broken_mssage_shown = true;
+                    }
+
+                    wxString msg( _T("WARNING---ENC Update chain incomplete. Substituting NULL update file: "));
+                    msg += ufile.GetFullName();
+                    wxLogMessage(msg);
+                    wxLogMessage(_T("   Subsequent ENC updates may produce errors.") );
+                    wxLogMessage(_T("   This ENC exchange set should be updated and SENCs rebuilt.") );
 
                     bool bstat;
                     DDFModule *dupdate = new DDFModule;
@@ -3632,7 +4903,6 @@ int s57chart::ValidateAndCountUpdates( const wxFileName file000, const wxString 
                         msg.Append( cp_ufile );
                         wxLogMessage( msg );
                     }
-
                 }
 
                 m_tmpup_array->Add( cp_ufile );
@@ -3642,7 +4912,7 @@ int s57chart::ValidateAndCountUpdates( const wxFileName file000, const wxString 
         //      Extract the date field from the last of the update files
         //      which is by definition a valid, present update file....
 
-        wxFileName lastfile( m_FullPath );
+        wxFileName lastfile( m_TempFilePath );
         wxString last_sext;
         last_sext.Printf( _T("%03d"), retval );
         lastfile.SetExt( last_sext );
@@ -3678,6 +4948,7 @@ int s57chart::ValidateAndCountUpdates( const wxFileName file000, const wxString 
     return retval;
 }
 
+
 wxString s57chart::GetISDT( void )
 {
     if( m_date000.IsValid() ) return m_date000.Format( _T("%Y%m%d") );
@@ -3685,16 +4956,17 @@ wxString s57chart::GetISDT( void )
         return _T("Unknown");
 }
 
-bool s57chart::GetBaseFileAttr( wxFileName fn )
+bool s57chart::GetBaseFileAttr( const wxString& file000 )
 {
-    if( !wxFileName::FileExists( fn.GetFullPath() ) ) return false;
+    if( !wxFileName::FileExists( file000 ) ) return false;
 
-    wxString FullPath000 = fn.GetFullPath();
+    wxString FullPath000 = file000;
     DDFModule *poModule = new DDFModule();
     if( !poModule->Open( FullPath000.mb_str() ) ) {
         wxString msg( _T("   s57chart::BuildS57File  Unable to open ") );
         msg.Append( FullPath000 );
         wxLogMessage( msg );
+        delete poModule;
         return false;
     }
 
@@ -3762,626 +5034,267 @@ bool s57chart::GetBaseFileAttr( wxFileName fn )
     return true;
 }
 
-int s57chart::BuildSENCFile( const wxString& FullPath000, const wxString& SENCFileName )
+int s57chart::BuildSENCFile( const wxString& FullPath000, const wxString& SENCFileName, bool b_progress )
 {
-    OGRFeature *objectDef;
-    OGRFeature *pEdgeVectorRecordFeature;
-    S57Reader *poReader;
-    int feid = 0;
-
-    int nProg = 0;
-    wxString nice_name;
-    int bbad_update = false;
-
-    wxString msg0( _T("Building SENC file for ") );
-    msg0.Append( FullPath000 );
-    msg0.Append( _T(" to ") );
-    msg0.Append( SENCFileName );
-    wxLogMessage( msg0 );
-
-    wxFileName SENCfile = wxFileName( SENCFileName );
-    wxFileName file000 = wxFileName( FullPath000 );
-
-    //      Make the target directory if needed
-    if( true != SENCfile.DirExists( SENCfile.GetPath() ) ) {
-        if( !SENCfile.Mkdir( SENCfile.GetPath() ) ) {
-            wxLogMessage(
-                    _T("   Cannot create SENC file directory for ") + SENCfile.GetFullPath() );
-            return BUILD_SENC_NOK_RETRY;
-        }
-    }
-
-    GetChartNameFromTXT( FullPath000, nice_name );
-
-    wxFileName tfn;
-    wxString tmp_file = tfn.CreateTempFileName( _T("") );
-
-    FILE *fps57;
-    const char *pp = "wb";
-    fps57 = fopen( tmp_file.mb_str(), pp );
-
-    char t[200];
-    strcpy( t, tmp_file.mb_str() );
-
-    if( fps57 == NULL ) {
-        wxString msg( _T("   s57chart::BuildS57File  Unable to create temp SENC file ") );
-        msg.Append( tfn.GetFullPath() );
-        wxLogMessage( msg );
-        return 0;
-    }
-
-    char temp[201];
-
-    fprintf( fps57, "SENC Version= %d\n", CURRENT_SENC_FORMAT_VERSION );
-
-    strncpy( temp, nice_name.mb_str(), 200 );
-    temp[200] = '\0';
-    fprintf( fps57, "NAME=%s\n", temp );
-
-    wxString date000 = m_date000.Format( _T("%Y%m%d") );
-    strncpy( temp, date000.mb_str(), 200 );
-    fprintf( fps57, "DATE000=%s\n", temp );
-
-    strncpy( temp, m_edtn000.mb_str(), 200 );
-    fprintf( fps57, "EDTN000=%s\n", temp );
-
-    //      Record .000 file date and size for primitive detection of updates to .000 file
-    wxDateTime ModTime000;
-    wxString mt = _T("20000101");
-    if( file000.GetTimes( NULL, &ModTime000, NULL ) ) mt = ModTime000.Format( _T("%Y%m%d") );
-    strncpy( temp, mt.mb_str(), 200 );
-    fprintf( fps57, "FILEMOD000=%s\n", temp );
-
-    int size000 = file000.GetSize().GetHi();
-    int size000l = file000.GetSize().GetLo();
-    fprintf( fps57, "FILESIZE000=%d%d\n", size000, size000l );
-
-    fprintf( fps57, "NOGR=%d\n", m_nGeoRecords );
-    fprintf( fps57, "SCALE=%d\n", m_native_scale );
-
-    wxString Message = SENCfile.GetFullPath();
-    Message.Append( _T("...Ingesting") );
-
-    wxString Title( _("OpenCPN S57 SENC File Create...") );
-    Title.append( SENCfile.GetFullPath() );
-
-    s_ProgDialog = new wxProgressDialog( Title, Message, m_nGeoRecords, NULL,
-            wxPD_AUTO_HIDE | wxPD_ELAPSED_TIME | wxPD_ESTIMATED_TIME | wxPD_REMAINING_TIME
-                    | wxPD_SMOOTH | wxSTAY_ON_TOP );
-
-    //      Analyze Updates
-    //      The OGR library will apply updates automatically, if enabled.
-    //      Alternatively, we can explicitely find and apply updates from any source directory.
-    //      We need to keep track of the last sequential update applied, to look out for new updates
-
-    int last_applied_update = 0;
-    wxString LastUpdateDate = date000;
-    last_applied_update = ValidateAndCountUpdates( file000, SENCfile.GetPath(), LastUpdateDate,
-            true );
-
-    wxString msg1;
-    msg1.Printf( _T("ENC update number is %3d"), last_applied_update );
-    wxLogMessage( msg1 );
-
-    fprintf( fps57, "UPDT=%d\n", last_applied_update );
-
-    strncpy( temp, LastUpdateDate.mb_str(), 200 );
-    fprintf( fps57, "DATEUPD=%s\n", temp );
-
-    //      Insert my local error handler to catch OGR errors,
-    //      Especially CE_Fatal type errors
-    //      Discovered/debugged on US5MD11M.017.  VI 548 geometry deleted
-    CPLPushErrorHandler( OpenCPN_OGRErrorHandler );
-
-    bool bcont = true;
-    int iObj = 0;
-    OGRwkbGeometryType geoType;
-    wxString sobj;
-
-    bcont = s_ProgDialog->Update( 1, _T("") );
-
-    //  Here comes the actual ISO8211 file reading
-    OGRS57DataSource *poS57DS = new OGRS57DataSource;
-    poS57DS->SetS57Registrar( g_poRegistrar );
-
-    //  Set up the options
-    char ** papszReaderOptions = NULL;
-//    papszReaderOptions = CSLSetNameValue(papszReaderOptions, S57O_LNAM_REFS, "ON" );
-    papszReaderOptions = CSLSetNameValue( papszReaderOptions, S57O_UPDATES, "ON" );
-    papszReaderOptions = CSLSetNameValue( papszReaderOptions, S57O_RETURN_LINKAGES, "ON" );
-    papszReaderOptions = CSLSetNameValue( papszReaderOptions, S57O_RETURN_PRIMITIVES, "ON" );
-    poS57DS->SetOptionList( papszReaderOptions );
-
-    //      Open the OGRS57DataSource
-    //      This will ingest the .000 file from the working dir, and apply updates
-
-    int open_return = poS57DS->Open( m_tmpup_array->Item( 0 ).mb_str(), TRUE, &s_ProgressCallBack ); ///172
-    if( open_return == BAD_UPDATE )         ///172
-    bbad_update = true;
-
-    bcont = s_ProgDialog->Update( 2, _T("") );
-    if( !bcont ) goto abort_point;
-
-    //      Get a pointer to the reader
-    poReader = poS57DS->GetModule( 0 );
-
-//        Prepare Vector Edge Helper table
-
-    /*
-     //        First, find the max RCID field by looking at each element in the index in turn
-
-     pEdgeVectorRecordFeature = poReader->ReadVector( feid, RCNM_VE );
-
-     while(NULL != pEdgeVectorRecordFeature)
-     {
-     //          pEdgeVectorRecordFeature->DumpReadable( stdout );
-
-     //          int record_id = pEdgeVectorRecordFeature-> GetFieldAsInteger( "RCID" );
-     //          if(record_id > rcid_max)
-     //                rcid_max = record_id;
-     feid++;
-     pEdgeVectorRecordFeature = poReader->ReadVector( feid, RCNM_VE );
-
-     }
-
-     //    m_nvector_table_size = feid + 1;
-
-     //        Allocate a table
-     //    m_pVectorEdgeHelperTable = (int *)calloc((m_nvector_table_size) * sizeof(int), 1);
-
-     */
-    //        And fill in the table
-    feid = 0;
-    pEdgeVectorRecordFeature = poReader->ReadVector( feid, RCNM_VE );
-    while( NULL != pEdgeVectorRecordFeature ) {
-        int record_id = pEdgeVectorRecordFeature->GetFieldAsInteger( "RCID" );
-
-        m_vector_helper_hash[record_id] = feid;
-
-        feid++;
-        delete pEdgeVectorRecordFeature;
-        pEdgeVectorRecordFeature = poReader->ReadVector( feid, RCNM_VE );
-    }
-
-    //      Update the options, removing the RETURN_PRIMITIVES flags
-    //      This flag needed to be set on ingest() to create the proper field defns,
-    //      but cleared to fetch normal features
-
-    papszReaderOptions = CSLSetNameValue( papszReaderOptions, S57O_RETURN_PRIMITIVES, "OFF" );
-    poReader->SetOptions( papszReaderOptions );
-    CSLDestroy( papszReaderOptions );
-
-    while( bcont ) {
-        //  Prepare for possible CE_Fatal error in GDAL
-        //  Corresponding longjmp() is in the local error handler
-        int setjmp_ret = 0;
-        setjmp_ret = setjmp( env_ogrf );
-        if( setjmp_ret == 1 )             //  CE_Fatal happened in GDAL library
-                                          //  in the ReadNextFeature() call below.
-                                          //  Seems odd, but that's setjmp/longjmp behaviour
-                                          //      Discovered/debugged on US5MD11M.017.  VI 548 geometry deleted
-
-                {
-//                TODO need to debug thissssssssss
-            wxLogMessage( _T("   s57chart(): GDAL/OGR Fatal Error caught on Obj #%d"), iObj );
-        }
-
-        objectDef = poReader->ReadNextFeature();
-
-        if( objectDef != NULL ) {
-
-            iObj++;
-
-//  Update the progress dialog
-            sobj = wxString( objectDef->GetDefnRef()->GetName(), wxConvUTF8 );
-            wxString idx;
-            idx.Printf( _T("  %d/%d       "), iObj, m_nGeoRecords );
-            sobj += idx;
-
-            nProg = iObj;
-            if( nProg > m_nGeoRecords - 1 ) nProg = m_nGeoRecords - 1;
-            if( s_ProgDialog ) bcont = s_ProgDialog->Update( nProg, sobj );
-
-            geoType = wkbUnknown;
-//      This test should not be necessary for real (i.e not C_AGGR) features
-//      However... some update files contain errors, and have deleted some
-//      geometry without deleting the corresponding feature(s).
-//      So, GeometryType becomes Unknown.
-//      e.g. US5MD11M.017
-//      In this case, all we can do is skip the feature....sigh.
-
-            if( objectDef->GetGeometryRef() != NULL ) geoType =
-                    objectDef->GetGeometryRef()->getGeometryType();
-
-//      n.b  This next line causes skip of C_AGGR features w/o geometry
-            if( geoType != wkbUnknown )                             // Write only if has wkbGeometry
-                    {
-                CreateSENCRecord( objectDef, fps57, 1, poReader );
-            }
-
-            delete objectDef;
-
-        } else
-            break;
-
-    }
-
-    if( bcont ) {
-        //      Create and write the Vector Edge Table
-        CreateSENCVectorEdgeTable( fps57, poReader );
-
-        //      Create and write the Connected NodeTable
-        CreateSENCConnNodeTable( fps57, poReader );
-    }
-
-    abort_point: delete poS57DS;
-
-    delete s_ProgDialog;
-    s_ProgDialog = NULL;
-
-    fclose( fps57 );
-
-    CPLPopErrorHandler();
-
-    //  Delete any temporary (working) real and dummy update files,
-    //  as well as .000 file created by ValidateAndCountUpdates()
-    if( m_tmpup_array ) {
-        for( unsigned int iff = 0; iff < m_tmpup_array->GetCount(); iff++ )
-            remove( m_tmpup_array->Item( iff ).mb_str() );
-        delete m_tmpup_array;
-    }
-
-    int ret_code = 0;
-
-    if( !bcont )                // aborted
-    {
-        wxRemoveFile( tmp_file );                     // kill the temp file
-        ret_code = BUILD_SENC_NOK_RETRY;
-    }
-
-    if( bcont ) {
-        remove( SENCfile.GetFullPath().mb_str() );
-        unlink( SENCfile.GetFullPath().mb_str() );       //  Delete any existing SENC file....
-
-        bool cpok = wxCopyFile( tmp_file, SENCfile.GetFullPath() );         // Delete temp file too?
-        wxRemoveFile( tmp_file );
-
-        if( !cpok ) {
-            wxString msg( _T("   Cannot copy temporary SENC file ") );
-            msg.Append( tmp_file );
-            msg.Append( _T(" to ") );
-            msg.Append( SENCfile.GetFullPath() );
-            wxLogMessage( msg );
-            ret_code = BUILD_SENC_NOK_RETRY;
-        } else
-            ret_code = BUILD_SENC_OK;
-
-    }
-
-    if( bbad_update ) OCPNMessageBox(NULL, 
-            _T("Errors encountered processing ENC update file(s).\nENC features may be incomplete or inaccurate."),
-            _T("OpenCPN Create SENC"), wxOK | wxICON_EXCLAMATION );
-
-    return ret_code;
+    //  LOD calculation
+    double display_ppm = 1 / .00025;     // nominal for most LCD displays
+    double meters_per_pixel_max_scale = GetNormalScaleMin(0,g_b_overzoom_x)/display_ppm;
+    m_LOD_meters = meters_per_pixel_max_scale * g_SENC_LOD_pixels;
+
+    //  Establish a common reference point for the chart
+    ref_lat = ( m_FullExtent.NLAT + m_FullExtent.SLAT ) / 2.;
+    ref_lon = ( m_FullExtent.WLON + m_FullExtent.ELON ) / 2.;
+    
+    Osenc senc;
+
+    senc.setRegistrar( g_poRegistrar );
+    senc.setRefLocn(ref_lat, ref_lon);
+    senc.SetLODMeters(m_LOD_meters);
+
+    int ret = senc.createSenc200( FullPath000, SENCFileName, b_progress );
+//    int ret = senc.createSenc124( FullPath000, SENCFileName );
+
+    return ret;
 }
+
+
+
 
 int s57chart::BuildRAZFromSENCFile( const wxString& FullPath )
 {
     int ret_val = 0;                    // default is OK
 
-    //    Sanity check for existence of file
-    wxFileName SENCFileName( FullPath );
-    if( !SENCFileName.FileExists() ) {
-        wxString msg( _T("   Cannot open SENC file ") );
-        msg.Append( SENCFileName.GetFullPath() );
-        wxLogMessage( msg );
+    Osenc sencfile;
 
+    // Set up the containers for ingestion results.
+    // These will be populated by Osenc, and owned by the caller (this).
+    S57ObjVector Objects;
+    VE_ElementVector VEs;
+    VC_ElementVector VCs;
+
+    sencfile.setRefLocn(ref_lat, ref_lon);
+
+    int srv = sencfile.ingest200(FullPath, &Objects, &VEs, &VCs);
+
+    if(srv != SENC_NO_ERROR){
+        wxLogMessage( sencfile.getLastError() );
+        //TODO  Clean up here, or massive leaks result
         return 1;
     }
 
-    int nProg = 0;
+    //  Get the cell Ref point as recorded in the SENC
+    Extent ext = sencfile.getReadExtent();
 
-    wxString ifs( FullPath );
+    m_FullExtent.ELON = ext.ELON;
+    m_FullExtent.WLON = ext.WLON;
+    m_FullExtent.NLAT = ext.NLAT;
+    m_FullExtent.SLAT = ext.SLAT;
+    m_bExtentSet = true;
 
-    wxFileInputStream fpx_u( ifs );
-    wxBufferedInputStream fpx( fpx_u );
+    ref_lat = (ext.NLAT + ext.SLAT) / 2.;
+    ref_lon = (ext.ELON + ext.WLON) / 2.;
 
-    int MAX_LINE = 499999;
-    char *buf = (char *) malloc( MAX_LINE + 1 );
+    //  Process the Edge feature arrays.
 
-    LUPrec *LUP;
-    LUPname LUP_Name = PAPER_CHART;
+    //    Create a hash map of VE_Element pointers as a chart class member
+    int n_ve_elements = VEs.size();
 
-    int nGeoFeature;
+    double scale = gFrame->GetBestVPScale(this);
+    int nativescale = GetNativeScale();
 
-    int object_count = 0;
+    for( int i = 0; i < n_ve_elements; i++ ) {
 
-    OGREnvelope Envelope;
+        VE_Element *vep = VEs.at( i );
+        if(vep && vep->nCount){
+            //  Get a bounding box for the edge
+            double east_max = -1e7; double east_min = 1e7;
+            double north_max = -1e7; double north_min = 1e7;
 
-    int dun = 0;
+            float *vrun = vep->pPoints;
+            for(size_t i=0 ; i < vep->nCount; i++){
+                east_max = wxMax(east_max, *vrun);
+                east_min = wxMin(east_min, *vrun);
+                vrun++;
 
-    hdr_buf = (char *) malloc( 1 );
-    wxProgressDialog *SENC_prog = NULL;
-    int nGeo1000;
-    wxString date_000, date_upd;
+                north_max = wxMax(north_max, *vrun);
+                north_min = wxMin(north_min, *vrun);
+                vrun++;
+            }
 
-//        if(my_fgets(buf, MAX_LINE, fpx) == 0)
-//           dun = 1;
-
-    while( !dun ) {
-
-        if( my_fgets( buf, MAX_LINE, fpx ) == 0 ) {
-            dun = 1;
-            break;
+            double lat1, lon1, lat2, lon2;
+            fromSM( east_min, north_min, ref_lat, ref_lon, &lat1, &lon1 );
+            fromSM( east_max, north_max, ref_lat, ref_lon, &lat2, &lon2 );
+            vep->edgeBBox.Set( lat1, lon1, lat2, lon2);
         }
 
-        if( !strncmp( buf, "OGRF", 4 ) ) {
+        m_ve_hash[vep->index] = vep;
+    }
 
-            S57Obj *obj = new S57Obj( buf, &fpx, 0, 0 );
-            if( obj ) {
 
-//      Build/Maintain the ATON floating/rigid arrays
-                if( GEO_POINT == obj->Primitive_type ) {
+    //    Create a hash map VC_Element pointers as a chart class member
+    int n_vc_elements = VCs.size();
 
-// set floating platform
-                    if( ( !strncmp( obj->FeatureName, "LITFLT", 6 ) )
-                            || ( !strncmp( obj->FeatureName, "LITVES", 6 ) )
-                            || ( !strncmp( obj->FeatureName, "BOY", 3 ) ) ) {
-                        pFloatingATONArray->Add( obj );
-                    }
+    for( int i = 0; i < n_vc_elements; i++ ) {
+        VC_Element *vcp = VCs.at( i );
+        m_vc_hash[vcp->index] = vcp;
+    }
 
-// set rigid platform
-                    if( !strncmp( obj->FeatureName, "BCN", 3 ) ) {
-                        pRigidATONArray->Add( obj );
-                    }
 
-                    //    Mark the object as an ATON
-                    if( ( !strncmp( obj->FeatureName, "LIT", 3 ) )
-                            || ( !strncmp( obj->FeatureName, "LIGHTS", 6 ) )
-                            || ( !strncmp( obj->FeatureName, "BCN", 3 ) )
-                            || ( !strncmp( obj->FeatureName, "BOY", 3 ) ) ) {
-                        obj->bIsAton = true;
-                    }
+    VEs.clear();        // destroy contents, no longer needed
+    VCs.clear();
+    
+    //Walk the vector of S57Objs, associating LUPS, instructions, etc...
 
+    for(unsigned int i=0 ; i < Objects.size() ; i++){
+
+        S57Obj *obj = Objects[i];
+
+        //      This is where Simplified or Paper-Type point features are selected
+        LUPrec *LUP;
+        LUPname LUP_Name = PAPER_CHART;
+
+        wxString objnam  = obj->GetAttrValueAsString("OBJNAM");
+        if (objnam.Len() > 0) {
+            wxString fe_name = wxString(obj->FeatureName, wxConvUTF8);
+            g_pi_manager->SendVectorChartObjectInfo( FullPath, fe_name, objnam, obj->m_lat, obj->m_lon, scale, nativescale );
+        }
+
+        switch( obj->Primitive_type ){
+            case GEO_POINT:
+            case GEO_META:
+            case GEO_PRIM:
+
+                if( PAPER_CHART == ps52plib->m_nSymbolStyle )
+                    LUP_Name = PAPER_CHART;
+                else
+                    LUP_Name = SIMPLIFIED;
+
+                break;
+
+            case GEO_LINE:
+                LUP_Name = LINES;
+                break;
+
+            case GEO_AREA:
+                if( PLAIN_BOUNDARIES == ps52plib->m_nBoundaryStyle )
+                    LUP_Name = PLAIN_BOUNDARIES;
+                else
+                    LUP_Name = SYMBOLIZED_BOUNDARIES;
+
+                break;
+        }
+
+        LUP = ps52plib->S52_LUPLookup( LUP_Name, obj->FeatureName, obj );
+
+        if( NULL == LUP ) {
+            if( g_bDebugS57 ) {
+                wxString msg( obj->FeatureName, wxConvUTF8 );
+                msg.Prepend( _T("   Could not find LUP for ") );
+                LogMessageOnce( msg );
+            }
+            delete obj;
+            obj = NULL;
+            Objects[i] = NULL;
+        } else {
+            //              Convert LUP to rules set
+            ps52plib->_LUP2rules( LUP, obj );
+
+            //              Add linked object/LUP to the working set
+            _insertRules( obj, LUP, this );
+
+            //              Establish Object's Display Category
+            obj->m_DisplayCat = LUP->DISC;
+
+            //              Establish objects base display priority
+            obj->m_DPRI = LUP->DPRI - '0';
+
+                //  Is this a category-movable object?
+            if( !strncmp(obj->FeatureName, "OBSTRN", 6) ||
+                    !strncmp(obj->FeatureName, "WRECKS", 6) ||
+                    !strncmp(obj->FeatureName, "DEPCNT", 6) ||
+                    !strncmp(obj->FeatureName, "UWTROC", 6) )
+                {
+                    obj->m_bcategory_mutable = true;
                 }
-
-//      This is where Simplified or Paper-Type point features are selected
-                switch( obj->Primitive_type ){
-                    case GEO_POINT:
-                    case GEO_META:
-                    case GEO_PRIM:
-
-                        if( PAPER_CHART == ps52plib->m_nSymbolStyle ) LUP_Name = PAPER_CHART;
-                        else
-                            LUP_Name = SIMPLIFIED;
-
-                        break;
-
-                    case GEO_LINE:
-                        LUP_Name = LINES;
-                        break;
-
-                    case GEO_AREA:
-                        if( PLAIN_BOUNDARIES == ps52plib->m_nBoundaryStyle ) LUP_Name =
-                                PLAIN_BOUNDARIES;
-                        else
-                            LUP_Name = SYMBOLIZED_BOUNDARIES;
-
-                        break;
-                }
-
-                LUP = ps52plib->S52_LUPLookup( LUP_Name, obj->FeatureName, obj );
-
-                if( NULL == LUP ) {
-                    if( g_bDebugS57 ) {
-                        wxString msg( obj->FeatureName, wxConvUTF8 );
-                        msg.Prepend( _T("   Could not find LUP for ") );
-                        LogMessageOnce( msg );
-                    }
-                    delete obj;
-                } else {
-//              Convert LUP to rules set
-                    ps52plib->_LUP2rules( LUP, obj );
-
-//              Add linked object/LUP to the working set
-                    _insertRules( obj, LUP, this );
-
-//              Establish Object's Display Category
-                    obj->m_DisplayCat = LUP->DISC;
-                }
-            }
-
-            object_count++;
-
-            if( ( object_count % 500 ) == 0 ) {
-                nProg = object_count / 500;
-                if( nProg > nGeo1000 - 1 ) nProg = nGeo1000 - 1;
-
-                if( SENC_prog ) SENC_prog->Update( nProg );
-            }
-
-            continue;
-
-        }               //OGRF
-
-        else if( !strncmp( buf, "VETableStart", 12 ) ) {
-            //    Use a wxArray for temp storage
-            //    then transfer to a simple linear array
-            ArrayOfVE_Elements ve_array;
-
-            int index = -1;
-            int index_max = -1;
-            int count;
-
-            fpx.Read( &index, sizeof(int) );
-
-            while( -1 != index ) {
-                fpx.Read( &count, sizeof(int) );
-
-                double *pPoints = NULL;
-                if( count ) {
-                    pPoints = (double *) malloc( count * 2 * sizeof(double) );
-                    fpx.Read( pPoints, count * 2 * sizeof(double) );
-                }
-
-                VE_Element vee;
-                vee.index = index;
-                vee.nCount = count;
-                vee.pPoints = pPoints;
-                vee.max_priority = -99;            // Default
-
-                ve_array.Add( vee );
-
-                if( index > index_max ) index_max = index;
-
-                //    Next element
-                fpx.Read( &index, sizeof(int) );
-            }
-
-            //    Create a hash map of VE_Element pointers as a chart class member
-            int n_ve_elements = ve_array.GetCount();
-
-            for( int i = 0; i < n_ve_elements; i++ ) {
-                VE_Element ve_from_array = ve_array.Item( i );
-                VE_Element *vep = new VE_Element;
-                vep->index = ve_from_array.index;
-                vep->nCount = ve_from_array.nCount;
-                vep->pPoints = ve_from_array.pPoints;
-
-//                        m_pve_array[vep->index] = vep;
-                m_ve_hash[vep->index] = vep;
-
-            }
-
-        }
-
-        else if( !strncmp( buf, "VCTableStart", 12 ) ) {
-            //    Use a wxArray for temp storage
-            //    then transfer to a simple linear array
-            ArrayOfVC_Elements vc_array;
-
-            int index = -1;
-            int index_max = -1;
-
-            fpx.Read( &index, sizeof(int) );
-
-            while( -1 != index ) {
-
-                double *pPoint = NULL;
-                pPoint = (double *) malloc( 2 * sizeof(double) );
-                fpx.Read( pPoint, 2 * sizeof(double) );
-
-                VC_Element vce;
-                vce.index = index;
-                vce.pPoint = pPoint;
-
-                vc_array.Add( vce );
-
-                if( index > index_max ) index_max = index;
-
-                //    Next element
-                fpx.Read( &index, sizeof(int) );
-            }
-
-            //    Create a hash map VC_Element pointers as a chart class member
-            int n_vc_elements = vc_array.GetCount();
-
-            for( int i = 0; i < n_vc_elements; i++ ) {
-                VC_Element vc_from_array = vc_array.Item( i );
-                VC_Element *vcp = new VC_Element;
-                vcp->index = vc_from_array.index;
-                vcp->pPoint = vc_from_array.pPoint;
-
-                m_vc_hash[vcp->index] = vcp;
+            else{
+                obj->m_bcategory_mutable = false;
             }
         }
 
-        else if( !strncmp( buf, "SENC", 4 ) ) {
-            int senc_file_version;
-            sscanf( buf, "SENC Version=%i", &senc_file_version );
-            if( senc_file_version != CURRENT_SENC_FORMAT_VERSION ) {
-                wxString msg( _T("   Wrong version on SENC file ") );
-                msg.Append( SENCFileName.GetFullPath() );
-                wxLogMessage( msg );
+        //      Build/Maintain the ATON floating/rigid arrays
+        if( obj && (GEO_POINT == obj->Primitive_type) ) {
 
-                dun = 1;
-                ret_val = 1;                   // error
+            // set floating platform
+            if( ( !strncmp( obj->FeatureName, "LITFLT", 6 ) )
+                || ( !strncmp( obj->FeatureName, "LITVES", 6 ) )
+                || ( !strncasecmp( obj->FeatureName, "BOY", 3 ) ) ) {
+                    pFloatingATONArray->Add( obj );
+            }
+
+            // set rigid platform
+            if( !strncasecmp( obj->FeatureName, "BCN", 3 ) ) {
+                pRigidATONArray->Add( obj );
+            }
+
+
+            //    Mark the object as an ATON
+            if( ( !strncmp( obj->FeatureName, "LIT", 3 ) )
+                    || ( !strncmp( obj->FeatureName, "LIGHTS", 6 ) )
+                    || ( !strncasecmp( obj->FeatureName, "BCN", 3 ) )
+                    || ( !strncasecmp( obj->FeatureName, "BOY", 3 ) ) ) {
+                obj->bIsAton = true;
             }
         }
 
-        else if( !strncmp( buf, "DATEUPD", 7 ) ) {
-            date_upd.Append( wxString( &buf[8], wxConvUTF8 ).BeforeFirst( '\n' ) );
-        }
+    }   // Objects iterator
 
-        else if( !strncmp( buf, "DATE000", 7 ) ) {
-            date_000.Append( wxString( &buf[8], wxConvUTF8 ).BeforeFirst( '\n' ) );
-        }
-
-        else if( !strncmp( buf, "SCALE", 5 ) ) {
-            int ins;
-            sscanf( buf, "SCALE=%d", &ins );
-            m_Chart_Scale = ins;
-        }
-
-        else if( !strncmp( buf, "NAME", 4 ) ) {
-            m_Name = wxString( &buf[5], wxConvUTF8 ).BeforeFirst( '\n' );
-        }
-
-        else if( !strncmp( buf, "NOGR", 4 ) ) {
-            sscanf( buf, "NOGR=%d", &nGeoFeature );
-
-            nGeo1000 = nGeoFeature / 500;
-
-#ifdef __WXMSW__
-            wxBeginBusyCursor();
-            /*
-             SENC_prog = new wxProgressDialog(  _("OpenCPN S57 SENC File Load"), FullPath, nGeo1000, NULL,
-             wxPD_AUTO_HIDE | wxPD_CAN_ABORT | wxPD_ELAPSED_TIME | wxPD_ESTIMATED_TIME | wxPD_REMAINING_TIME | wxPD_SMOOTH);
-             */
-            wxEndBusyCursor();
-
-#endif
-        }
-    }                       //while(!dun)
-
-//      fclose(fpx);
-
-    free( buf );
-
-    free( hdr_buf );
-
-    delete SENC_prog;
 
     //   Decide on pub date to show
 
-    int d000 = atoi(
-            ( date_000/*(wxString((const wchar_t *)date_000, wxConvUTF8)*/.Mid( 0, 4 ) ).mb_str() );
-    int dupd = atoi(
-            ( date_upd/*(wxString((const wchar_t *)date_upd, wxConvUTF8)*/.Mid( 0, 4 ) ).mb_str() );
+    wxDateTime d000;
+    d000.ParseFormat( sencfile.getBaseDate(), _T("%Y%m%d") );
+    if( !d000.IsValid() )
+        d000.ParseFormat( _T("20000101"), _T("%Y%m%d") );
 
-    if( dupd > d000 ) m_PubYear = date_upd/*wxString((const wchar_t *)date_upd, wxConvUTF8)*/.Mid(
-            0, 4 );
+    wxDateTime updt;
+    updt.ParseFormat( sencfile.getUpdateDate(), _T("%Y%m%d") );
+    if( !updt.IsValid() )
+        updt.ParseFormat( _T("20000101"), _T("%Y%m%d") );
+
+    if(updt.IsLaterThan(d000))
+        m_PubYear.Printf(_T("%4d"), updt.GetYear());
     else
-        m_PubYear = date_000/*wxString((const wchar_t *)date_000, wxConvUTF8)*/.Mid( 0, 4 );
+        m_PubYear.Printf(_T("%4d"), d000.GetYear());
 
-    //    Set some base class values
-    wxDateTime upd;
-    upd.ParseFormat( date_upd, _T("%Y%m%d") );
-    if( !upd.IsValid() ) upd.ParseFormat( _T("20000101"), _T("%Y%m%d") );
 
-    upd.ResetTime();
-    m_EdDate = upd;
 
-    m_SE = m_edtn000;
+//    Set some base class values
+     wxDateTime upd = updt;
+     if( !upd.IsValid() )
+         upd.ParseFormat( _T("20000101"), _T("%Y%m%d") );
+
+     upd.ResetTime();
+     m_EdDate = upd;
+
+     m_SE = sencfile.getSENCReadBaseEdition();
+
+    wxString supdate;
+    supdate.Printf(_T(" / %d"), sencfile.getSENCReadLastUpdate());
+    m_SE += supdate;
+
+
     m_datum_str = _T("WGS84");
 
     m_SoundingsDatum = _T("MEAN LOWER LOW WATER");
-    m_ID = SENCFileName.GetName();
-
-    // Validate hash maps....
+    m_ID = sencfile.getReadID();
+    m_Name = sencfile.getReadName();
 
     ObjRazRules *top;
     ObjRazRules *nxx;
+
+#if 0 //TODO
+    // Validate hash maps....
+
 
     for( int i = 0; i < PRIO_NUM; ++i ) {
         for( int j = 0; j < LUPNAME_NUM; j++ ) {
@@ -4395,33 +5308,42 @@ int s57chart::BuildRAZFromSENCFile( const wxString& FullPath )
                     int *index_run = &obj->m_lsindex_array[seg_index];
 
                     //  Get first connected node
-                    int inode = *index_run++;
-                    if( ( inode >= 0 ) ) {
-                        if( m_vc_hash.find( inode ) == m_vc_hash.end() ) {
+                    int inode = *index_run;
+                    if( ( inode ) ) {
+                        if( old_m_vc_hash.find( inode ) == old_m_vc_hash.end() ) {
                             //    Must be a bad index in the SENC file
                             //    Stuff a recognizable flag to indicate invalidity
-                            index_run--;
-                            *index_run = -1;
-                            index_run++;
+                            *index_run = 0;
+                            old_m_vc_hash[0] = 0;
+                        }
+                    }
+                    index_run++;
+
+                    //  Get the edge
+                    int enode = *index_run;
+                    if( ( enode ) ) {
+                        if( old_m_ve_hash.find( enode ) == old_m_ve_hash.end() ) {
+                    //    Must be a bad index in the SENC file
+                    //    Stuff a recognizable flag to indicate invalidity
+                            *index_run = 0;
+                            old_m_ve_hash[0] = 0;
                         }
                     }
 
-                    //  Get the edge
-//                              int enode = *index_run++;
                     index_run++;
 
                     //  Get last connected node
-                    int jnode = *index_run++;
-                    if( ( jnode >= 0 ) ) {
-                        if( m_vc_hash.find( jnode ) == m_vc_hash.end() ) {
+                    int jnode = *index_run;
+                    if( ( jnode ) ) {
+                        if( old_m_vc_hash.find( jnode ) == old_m_vc_hash.end() ) {
                             //    Must be a bad index in the SENC file
                             //    Stuff a recognizable flag to indicate invalidity
-                            index_run--;
-                            *index_run = -2;
-                            index_run++;
+                            *index_run = 0;
+                            old_m_vc_hash[0] = 0;
                         }
-
                     }
+                    index_run++;
+
                 }
 ///
                 nxx = top->next;
@@ -4429,43 +5351,30 @@ int s57chart::BuildRAZFromSENCFile( const wxString& FullPath )
             }
         }
     }
+#endif
+
+    //  Set up the chart context
+    m_this_chart_context = (chart_context *)calloc( sizeof(chart_context), 1);
+    m_this_chart_context->chart = this;
+
+    //  Loop and populate all the objects
+    for( int i = 0; i < PRIO_NUM; ++i ) {
+        for( int j = 0; j < LUPNAME_NUM; j++ ) {
+            top = razRules[i][j];
+            while( top != NULL ) {
+                S57Obj *obj = top->obj;
+                obj->m_chart_context = m_this_chart_context;
+                top = top->next;
+            }
+        }
+    }
+
+    AssembleLineGeometry();
 
     return ret_val;
 }
 
-//------------------------------------------------------------------------------
-//      Local version of fgets for Binary Mode (SENC) file
-//------------------------------------------------------------------------------
-int s57chart::my_fgets( char *buf, int buf_len_max, wxInputStream& ifs )
 
-{
-    char chNext;
-    int nLineLen = 0;
-    char *lbuf;
-
-    lbuf = buf;
-
-    while( !ifs.Eof() && nLineLen < buf_len_max ) {
-        chNext = (char) ifs.GetC();
-
-        /* each CR/LF (or LF/CR) as if just "CR" */
-        if( chNext == 10 || chNext == 13 ) {
-            chNext = '\n';
-        }
-
-        *lbuf = chNext;
-        lbuf++, nLineLen++;
-
-        if( chNext == '\n' ) {
-            *lbuf = '\0';
-            return nLineLen;
-        }
-    }
-
-    *( lbuf ) = '\0';
-
-    return nLineLen;
-}
 
 int s57chart::_insertRules( S57Obj *obj, LUPrec *LUP, s57chart *pOwner )
 {
@@ -4540,9 +5449,10 @@ int s57chart::_insertRules( S57Obj *obj, LUPrec *LUP, s57chart *pOwner )
     rzRules->obj = obj;
     obj->nRef++;                         // Increment reference counter for delete check;
     rzRules->LUP = LUP;
-    rzRules->chart = pOwner;
+//    rzRules->chart = pOwner;
     rzRules->next = razRules[disPrioIdx][LUPtypeIdx];
     rzRules->child = NULL;
+    rzRules->mps = NULL;
     razRules[disPrioIdx][LUPtypeIdx] = rzRules;
 
     return 1;
@@ -4553,42 +5463,38 @@ void s57chart::ResetPointBBoxes( const ViewPort &vp_last, const ViewPort &vp_thi
     ObjRazRules *top;
     ObjRazRules *nxx;
 
-    double box_margin = 0.25;
-
-    //    Assume a 50x50 pixel box
-    box_margin = ( 50. / vp_this.view_scale_ppm ) / ( 1852. * 60. );  //degrees
+    double d = vp_last.view_scale_ppm / vp_this.view_scale_ppm;
 
     for( int i = 0; i < PRIO_NUM; ++i ) {
-        top = razRules[i][0];
+        for( int j = 0; j < 2; ++j ) {
+            top = razRules[i][j];
 
-        while( top != NULL ) {
-            if( !top->obj->geoPtMulti )                      // do not reset multipoints
-            {
-                top->obj->bBBObj_valid = false;
-                top->obj->BBObj.SetMin( top->obj->m_lon - box_margin,
-                        top->obj->m_lat - box_margin );
-                top->obj->BBObj.SetMax( top->obj->m_lon + box_margin,
-                        top->obj->m_lat + box_margin );
+            while( top != NULL ) {
+                if( !top->obj->geoPtMulti )                      // do not reset multipoints
+                {
+                    if(top->obj->BBObj.GetValid()) { // scale bbobj
+                        double lat = top->obj->m_lat, lon = top->obj->m_lon;
+
+                        double lat1 = (lat - top->obj->BBObj.GetMinLat()) * d;
+                        double lat2 = (lat - top->obj->BBObj.GetMaxLat()) * d;
+
+                        double minlon = top->obj->BBObj.GetMinLon();
+                        double maxlon = top->obj->BBObj.GetMaxLon();
+
+                        double lon1 = (lon - minlon) * d;
+                        double lon2 = (lon - maxlon) * d;
+
+                        top->obj->BBObj.Set( lat - lat1, lon - lon1,
+                                             lat - lat2, lon - lon2 );
+
+                        // this method is very close, but errors accumulate
+                        top->obj->BBObj.Invalidate();
+                    }
+                }
+
+                nxx = top->next;
+                top = nxx;
             }
-
-            nxx = top->next;
-            top = nxx;
-        }
-
-        top = razRules[i][1];
-
-        while( top != NULL ) {
-            if( !top->obj->geoPtMulti )                      // do not reset multipoints
-            {
-                top->obj->bBBObj_valid = false;
-                top->obj->BBObj.SetMin( top->obj->m_lon - box_margin,
-                        top->obj->m_lat - box_margin );
-                top->obj->BBObj.SetMax( top->obj->m_lon + box_margin,
-                        top->obj->m_lat + box_margin );
-            }
-
-            nxx = top->next;
-            top = nxx;
         }
     }
 }
@@ -4608,10 +5514,10 @@ void s57chart::UpdateLUPs( s57chart *pOwner )
     ObjRazRules *top;
     ObjRazRules *nxx;
     LUPrec *LUP;
-
     for( int i = 0; i < PRIO_NUM; ++i ) {
         //  SIMPLIFIED is set, PAPER_CHART is bare
         if( ( razRules[i][0] ) && ( NULL == razRules[i][1] ) ) {
+            m_b2pointLUPS = true;
             top = razRules[i][0];
 
             while( top != NULL ) {
@@ -4633,6 +5539,7 @@ void s57chart::UpdateLUPs( s57chart *pOwner )
 
         //  PAPER_CHART is set, SIMPLIFIED is bare
         if( ( razRules[i][1] ) && ( NULL == razRules[i][0] ) ) {
+            m_b2pointLUPS = true;
             top = razRules[i][1];
 
             while( top != NULL ) {
@@ -4652,6 +5559,7 @@ void s57chart::UpdateLUPs( s57chart *pOwner )
 
         //  PLAIN_BOUNDARIES is set, SYMBOLIZED_BOUNDARIES is bare
         if( ( razRules[i][3] ) && ( NULL == razRules[i][4] ) ) {
+            m_b2lineLUPS = true;
             top = razRules[i][3];
 
             while( top != NULL ) {
@@ -4670,6 +5578,7 @@ void s57chart::UpdateLUPs( s57chart *pOwner )
 
         //  SYMBOLIZED_BOUNDARIES is set, PLAIN_BOUNDARIES is bare
         if( ( razRules[i][4] ) && ( NULL == razRules[i][3] ) ) {
+            m_b2lineLUPS = true;
             top = razRules[i][4];
 
             while( top != NULL ) {
@@ -4693,6 +5602,8 @@ void s57chart::UpdateLUPs( s57chart *pOwner )
             top = razRules[i][j];
             while( top != NULL ) {
                 top->obj->bCS_Added = 0;
+                if (top->LUP)
+                    top->obj->m_DisplayCat = top->LUP->DISC;
 
                 nxx = top->next;
                 top = nxx;
@@ -4710,6 +5621,8 @@ void s57chart::UpdateLUPs( s57chart *pOwner )
                     ObjRazRules *ctop = top->child;
                     while( NULL != ctop ) {
                         ctop->obj->bCS_Added = 0;
+                        if (ctop->LUP)
+                            ctop->obj->m_DisplayCat = ctop->LUP->DISC;
                         ctop = ctop->next;
                     }
                 }
@@ -4725,6 +5638,7 @@ void s57chart::UpdateLUPs( s57chart *pOwner )
     // TODO really should make the dynamic LUPs belong to the chart class that created them
 }
 
+#if 0
 void s57chart::CreateSENCRecord( OGRFeature *pFeature, FILE * fpOut, int mode, S57Reader *poReader )
 {
 
@@ -4740,25 +5654,59 @@ void s57chart::CreateSENCRecord( OGRFeature *pFeature, FILE * fpOut, int mode, S
         if( pFeature->IsFieldSet( iField ) ) {
             if( ( iField == 1 ) || ( iField > 7 ) ) {
                 OGRFieldDefn *poFDefn = pFeature->GetDefnRef()->GetFieldDefn( iField );
-
                 const char *pType = OGRFieldDefn::GetFieldTypeName( poFDefn->GetType() );
+                const char *pAttrName = poFDefn->GetNameRef();
+                const char *pAttrVal = pFeature->GetFieldAsString( iField );
 
-                snprintf( line, MAX_HDR_LINE - 2, "  %s (%c) = %s", poFDefn->GetNameRef(), *pType,
-                        pFeature->GetFieldAsString( iField ) );
+                if(strlen( pAttrVal ) ) {
+                    snprintf( line, MAX_HDR_LINE - 2, "  %s (%c) = ", pAttrName, *pType);
+                    wxString AttrStringPrefix = wxString( line, wxConvUTF8 );
 
-				// Attempt different conversions to accomodate different language encodings in
-				// theoriginal files.
+                    wxString wxAttrValue;
 
-				wxString wxAttrValue( line, wxConvUTF8 );
+                    if( (0 == strncmp("NOBJNM",pAttrName, 6) ) ||
+                        (0 == strncmp("NINFOM",pAttrName, 6) ) ||
+                        (0 == strncmp("NPLDST",pAttrName, 6) ) ||
+                        (0 == strncmp("NTXTDS",pAttrName, 6) ) )
+                    {
+                        if( poReader->GetNall() == 2) {     // ENC is using UCS-2 / UTF-16 encoding
+                            wxMBConvUTF16 conv;
+                            wxString att_conv(pAttrVal, conv);
+                            att_conv.RemoveLast();      // Remove the \037 that terminates UTF-16 strings in S57
+                            att_conv.Replace(_T("\n"), _T("|") );  //Replace  <new line> with special break character
+                            wxAttrValue = att_conv;
+                        }
+                        else if( poReader->GetNall() == 1) {     // ENC is using Lex level 1 (ISO 8859_1) encoding
+                            wxCSConv conv(_T("iso8859-1") );
+                            wxString att_conv(pAttrVal, conv);
+                            wxAttrValue = att_conv;
+                        }
+                    }
 
-				if( wxAttrValue.Length() < strlen(line) )
-					wxAttrValue = wxString( line, wxConvISO8859_1 );
+                    if( wxAttrValue.IsEmpty()) {
+        // Attempt different conversions to accomodate different language encodings in
+        // the original ENC files.
 
-				if( wxAttrValue.Length() < strlen(line) )
-					wxLogError( _T("Warning: CreateSENCRecord(): Failed to convert string value to wxString.") );
+        //  For attribute fields other that "National" Objects, (handled above)  See FS#1464
+        //  the text must be encoded in simple ASCII, or in lex level 1 (i.e. iso8859-1)
 
-                sheader += wxAttrValue;
-                sheader += '\n';
+                        wxAttrValue = wxString( pAttrVal, wxConvUTF8 );
+
+                        if( 0 ==wxAttrValue.Length() ) {
+                            wxCSConv conv(_T("iso8859-1") );
+                            wxString att_conv(pAttrVal, conv);
+                            wxAttrValue = att_conv;
+                        }
+
+                        if( 0 ==wxAttrValue.Length() ) {
+                            wxLogError( _T("Warning: CreateSENCRecord(): Failed to convert string value to wxString.") );
+                        }
+                    }
+
+                    sheader += AttrStringPrefix;
+                    sheader += wxAttrValue;
+                    sheader += '\n';
+                }
             }
         }
     }
@@ -4780,11 +5728,12 @@ void s57chart::CreateSENCRecord( OGRFeature *pFeature, FILE * fpOut, int mode, S
     }
 
     if( mode == 1 ) {
-        sprintf( line, "  %s %g %g\n", pGeo->getGeometryName(), ref_lat, ref_lon );
+        sprintf( line, "  %s %f %f\n", pGeo->getGeometryName(), ref_lat, ref_lon );
         sheader += wxString( line, wxConvUTF8 );
     }
-    fprintf( fpOut, "HDRLEN=%lu\n", (unsigned long) sheader.Len() );
-    fwrite( sheader.mb_str( wxConvUTF8 ), 1, sheader.Len(), fpOut );
+    wxCharBuffer buffer=sheader.ToUTF8();
+    fprintf( fpOut, "HDRLEN=%lu\n", (unsigned long) strlen(buffer) );
+    fwrite( buffer.data(), 1, strlen(buffer), fpOut );
 
     if( ( pGeo != NULL ) /*&& (mode == 1)*/) {
         int wkb_len = pGeo->WkbSize();
@@ -4834,16 +5783,30 @@ void s57chart::CreateSENCRecord( OGRFeature *pFeature, FILE * fpOut, int mode, S
                 for( i = 0; i < ip; i++ )                           // convert doubles to floats
                         {                                                 // computing bbox as we go
 
-                    float lon = (float) *psd++;
-                    float lat = (float) *psd++;
+                    float lon, lat;
+                    double easting, northing;
+#ifdef ARMHF
+                    double east_d, north_d;
+                    memcpy(&east_d, psd++, sizeof(double));
+                    memcpy(&north_d, psd++, sizeof(double));
+                    lon = east_d;
+                    lat = north_d;
 
                     //  Calculate SM from chart common reference point
-                    double easting, northing;
+                    toSM( lat, lon, ref_lat, ref_lon, &easting, &northing );
+                    memcpy(pdf++, &easting, sizeof(float));
+                    memcpy(pdf++, &northing, sizeof(float));
+
+#else
+                    lon = (float) *psd++;
+                    lat = (float) *psd++;
+
+                    //  Calculate SM from chart common reference point
                     toSM( lat, lon, ref_lat, ref_lon, &easting, &northing );
 
                     *pdf++ = easting;
                     *pdf++ = northing;
-
+#endif
                     lonmax = fmax(lon, lonmax);
                     lonmin = fmin(lon, lonmin);
                     latmax = fmax(lat, latmax);
@@ -4851,12 +5814,23 @@ void s57chart::CreateSENCRecord( OGRFeature *pFeature, FILE * fpOut, int mode, S
 
                 }
 
+#ifdef ARMHF
+                float tmp;
+                tmp = lonmax;
+                memcpy(pdf++, &tmp, sizeof(float));
+                tmp = lonmin;
+                memcpy(pdf++, &tmp, sizeof(float));
+                tmp = latmax;
+                memcpy(pdf++, &tmp, sizeof(float));
+                tmp = latmin;
+                memcpy(pdf, &tmp, sizeof(float));
+#else
                 //      Store the Bounding Box as lat/lon
                 *pdf++ = lonmax;
                 *pdf++ = lonmin;
                 *pdf++ = latmax;
                 *pdf = latmin;
-
+#endif
                 fwrite( psb_buffer, 1, sb_len, fpOut );
                 fprintf( fpOut, "\n" );
                 free( psb_buffer );
@@ -4949,12 +5923,10 @@ void s57chart::CreateSENCRecord( OGRFeature *pFeature, FILE * fpOut, int mode, S
                 wkb_len = pGeo->WkbSize();
                 fprintf( fpOut, "  %d\n", wkb_len );
                 fwrite( pwkb_buffer, 1, wkb_len, fpOut );
-
                 break;
 
             case wkbPoint: {
                 int nq_len = 4;                                     // nQual length
-//                    int nqual = *(int *)(pwkb_buffer + 5);              // fetch nqual
 
                 sb_len = ( ( wkb_len - ( 5 + nq_len ) ) / 2 ) + 5; // data will be 4 byte float, not double
                                                                    // and skipping nQual
@@ -4972,19 +5944,32 @@ void s57chart::CreateSENCRecord( OGRFeature *pFeature, FILE * fpOut, int mode, S
                 psd = (double *) ps;
                 pdf = (float *) pd;
 
+#ifdef ARMHF
+                double lata, lona;
+                memcpy(&lona, psd, sizeof(double));
+                memcpy(&lata, &psd[1], sizeof(double));
+                lon = lona;
+                lat = lata;
+#else
                 lon = *psd++;                                      // fetch the point
                 lat = *psd;
+#endif
 
-//                    if(314 == pFeature->GetFID())
-//                          int yyp = 4;
 
                 //  Calculate SM from chart common reference point
                 double easting, northing;
                 toSM( lat, lon, ref_lat, ref_lon, &easting, &northing );
 
+#ifdef ARMHF
+                float east, north;
+                east = easting;
+                north = northing;
+                memcpy(pdf++, &east, sizeof(float));
+                memcpy(pdf,   &north, sizeof(float));
+#else
                 *pdf++ = easting;
                 *pdf = northing;
-
+#endif
                 //  And write it out
                 fwrite( psb_buffer, 1, sb_len, fpOut );
                 fprintf( fpOut, "\n" );
@@ -4994,6 +5979,7 @@ void s57chart::CreateSENCRecord( OGRFeature *pFeature, FILE * fpOut, int mode, S
                 break;
             }
 
+            case wkbMultiPoint:
             case wkbMultiPoint25D:
                 ps = pwkb_buffer;
                 ps += 5;
@@ -5031,24 +6017,23 @@ void s57chart::CreateSENCRecord( OGRFeature *pFeature, FILE * fpOut, int mode, S
                     lat = pt_geom->getY();
                     double depth = pt_geom->getZ();
 
-                    /*
-                     ps += 5;
-                     psd = (double *)ps;
-
-                     lon = *psd++;
-                     lat = *psd++;
-                     double depth = *psd;
-                     */
-
-                    //  Calculate SM from chart common reference point
+                     //  Calculate SM from chart common reference point
                     double easting, northing;
                     toSM( lat, lon, ref_lat, ref_lon, &easting, &northing );
 
+#ifdef ARMHF
+                    float east = easting;
+                    float north = northing;
+                    float deep = depth;
+                    memcpy(pdf++, &east, sizeof(float));
+                    memcpy(pdf++, &north, sizeof(float));
+                    memcpy(pdf++, &deep, sizeof(float));
+
+#else
                     *pdf++ = easting;
                     *pdf++ = northing;
                     *pdf++ = (float) depth;
-
-//                        ps += 3 * sizeof(double);
+#endif
 
                     //  Keep a running calculation of min/max
                     lonmax = fmax(lon, lonmax);
@@ -5058,11 +6043,22 @@ void s57chart::CreateSENCRecord( OGRFeature *pFeature, FILE * fpOut, int mode, S
                 }
 
                 //      Store the Bounding Box as lat/lon
+#ifdef ARMHF
+                float tmp;
+                tmp = lonmax;
+                memcpy(pdf++, &tmp, sizeof(float));
+                tmp = lonmin;
+                memcpy(pdf++, &tmp, sizeof(float));
+                tmp = latmax;
+                memcpy(pdf++, &tmp, sizeof(float));
+                tmp = latmin;
+                memcpy(pdf, &tmp, sizeof(float));
+#else
                 *pdf++ = lonmax;
                 *pdf++ = lonmin;
                 *pdf++ = latmax;
                 *pdf = latmin;
-
+#endif
                 //  And write it out
                 fwrite( psb_buffer, 1, sb_len, fpOut );
                 free( psb_buffer );
@@ -5073,95 +6069,96 @@ void s57chart::CreateSENCRecord( OGRFeature *pFeature, FILE * fpOut, int mode, S
                 //      Special case, polygons are handled separately
             case wkbPolygon: {
                 int error_code;
+
                 PolyTessGeo *ppg = NULL;
 
                 OGRPolygon *poly = (OGRPolygon *) ( pGeo );
 
-                ppg = new PolyTessGeo( poly, true, ref_lat, ref_lon, 0 );   //try to use glu library
+                ppg = new PolyTessGeo( poly, true, ref_lat, ref_lon, false, m_LOD_meters );   //try to use glu library
 
                 error_code = ppg->ErrorCode;
                 if( error_code == ERROR_NO_DLL ) {
                     if( !bGLUWarningSent ) {
-                        wxLogMessage(
-                                _T("   Warning...Could not find glu32.dll, trying internal tess.") );
+                        wxLogMessage( _T("   Warning...Could not find glu32.dll, trying internal tess.") );
                         bGLUWarningSent = true;
                     }
 
                     delete ppg;
                     //  Try with internal tesselator
-                    ppg = new PolyTessGeo( poly, true, ref_lat, ref_lon, 1 );
+                    ppg = new PolyTessGeo( poly, true, ref_lat, ref_lon, true, m_LOD_meters );
                     error_code = ppg->ErrorCode;
                 }
 
-                if( error_code ) wxLogMessage( _T("   Error: S57 SENC Create Error %d"),
-                        ppg->ErrorCode );
-
+                if( error_code )
+                    wxLogMessage( _T("   Warning: S57 SENC Geometry Error %d, Some Features ignored."), ppg->ErrorCode );
                 else
                     ppg->Write_PolyTriGroup( fpOut );
+
                 delete ppg;
 
                 //    Capture the Vector Table geometry indices
+                if( !error_code ) {
+                    int *pNAME_RCID;
+                    int nEdgeVectorRecords;
+                    OGRFeature *pEdgeVectorRecordFeature;
 
-                int *pNAME_RCID;
-                int nEdgeVectorRecords;
-                OGRFeature *pEdgeVectorRecordFeature;
+                    pNAME_RCID = (int *) pFeature->GetFieldAsIntegerList( "NAME_RCID",
+                            &nEdgeVectorRecords );
 
-                pNAME_RCID = (int *) pFeature->GetFieldAsIntegerList( "NAME_RCID",
-                        &nEdgeVectorRecords );
+                    fprintf( fpOut, "LSINDEXLIST %d\n", nEdgeVectorRecords );
 
-                fprintf( fpOut, "LSINDEXLIST %d\n", nEdgeVectorRecords );
+                    //  Set up the options, adding RETURN_PRIMITIVES
+                    char ** papszReaderOptions = NULL;
+                    papszReaderOptions = CSLSetNameValue( papszReaderOptions, S57O_UPDATES, "ON" );
+                    papszReaderOptions = CSLSetNameValue( papszReaderOptions, S57O_RETURN_LINKAGES,
+                            "ON" );
+                    papszReaderOptions = CSLSetNameValue( papszReaderOptions, S57O_RETURN_PRIMITIVES,
+                            "ON" );
+                    poReader->SetOptions( papszReaderOptions );
 
-                //  Set up the options, adding RETURN_PRIMITIVES
-                char ** papszReaderOptions = NULL;
-                papszReaderOptions = CSLSetNameValue( papszReaderOptions, S57O_UPDATES, "ON" );
-                papszReaderOptions = CSLSetNameValue( papszReaderOptions, S57O_RETURN_LINKAGES,
-                        "ON" );
-                papszReaderOptions = CSLSetNameValue( papszReaderOptions, S57O_RETURN_PRIMITIVES,
-                        "ON" );
-                poReader->SetOptions( papszReaderOptions );
+    //    Capture the beginning and end point connected nodes for each edge vector record
+                    for( i = 0; i < nEdgeVectorRecords; i++ ) {
+                        int start_rcid, end_rcid;
+                        /*
+                        //  Filter out absurd RCIDs, found first on cell IT300017.000
+                        if((pNAME_RCID[i] >= 0) && (pNAME_RCID[i] <= m_nvector_table_size))
+                        {
+                        int target_record_feid = m_pVectorEdgeHelperTable[pNAME_RCID[i]];
+                        pEdgeVectorRecordFeature = poReader->ReadVector( target_record_feid, RCNM_VE );
+                        }
+                        else
+                        pEdgeVectorRecordFeature = NULL;
+                        */
+                        int target_record_feid = m_vector_helper_hash[pNAME_RCID[i]];
+                        pEdgeVectorRecordFeature = poReader->ReadVector( target_record_feid, RCNM_VE );
 
-//    Capture the beginning and end point connected nodes for each edge vector record
-                for( i = 0; i < nEdgeVectorRecords; i++ ) {
-                    int start_rcid, end_rcid;
-                    /*
-                     //  Filter out absurd RCIDs, found first on cell IT300017.000
-                     if((pNAME_RCID[i] >= 0) && (pNAME_RCID[i] <= m_nvector_table_size))
-                     {
-                     int target_record_feid = m_pVectorEdgeHelperTable[pNAME_RCID[i]];
-                     pEdgeVectorRecordFeature = poReader->ReadVector( target_record_feid, RCNM_VE );
-                     }
-                     else
-                     pEdgeVectorRecordFeature = NULL;
-                     */
-                    int target_record_feid = m_vector_helper_hash[pNAME_RCID[i]];
-                    pEdgeVectorRecordFeature = poReader->ReadVector( target_record_feid, RCNM_VE );
+                        if( NULL != pEdgeVectorRecordFeature ) {
+                            start_rcid = pEdgeVectorRecordFeature->GetFieldAsInteger( "NAME_RCID_0" );
+                            end_rcid = pEdgeVectorRecordFeature->GetFieldAsInteger( "NAME_RCID_1" );
 
-                    if( NULL != pEdgeVectorRecordFeature ) {
-                        start_rcid = pEdgeVectorRecordFeature->GetFieldAsInteger( "NAME_RCID_0" );
-                        end_rcid = pEdgeVectorRecordFeature->GetFieldAsInteger( "NAME_RCID_1" );
+                            fwrite( &start_rcid, 1, sizeof(int), fpOut );
+                            fwrite( &pNAME_RCID[i], 1, sizeof(int), fpOut );
+                            fwrite( &end_rcid, 1, sizeof(int), fpOut );
 
-                        fwrite( &start_rcid, 1, sizeof(int), fpOut );
-                        fwrite( &pNAME_RCID[i], 1, sizeof(int), fpOut );
-                        fwrite( &end_rcid, 1, sizeof(int), fpOut );
+                            delete pEdgeVectorRecordFeature;
+                        } else {
+                            start_rcid = -1;                                    // error indication
+                            end_rcid = -2;
 
-                        delete pEdgeVectorRecordFeature;
-                    } else {
-                        start_rcid = -1;                                    // error indication
-                        end_rcid = -2;
-
-                        fwrite( &start_rcid, 1, sizeof(int), fpOut );
-                        fwrite( &pNAME_RCID[i], 1, sizeof(int), fpOut );
-                        fwrite( &end_rcid, 1, sizeof(int), fpOut );
+                            fwrite( &start_rcid, 1, sizeof(int), fpOut );
+                            fwrite( &pNAME_RCID[i], 1, sizeof(int), fpOut );
+                            fwrite( &end_rcid, 1, sizeof(int), fpOut );
+                        }
                     }
+
+                    fprintf( fpOut, "\n" );
+
+                    //  Reset the options
+                    papszReaderOptions = CSLSetNameValue( papszReaderOptions, S57O_RETURN_PRIMITIVES,
+                            "OFF" );
+                    poReader->SetOptions( papszReaderOptions );
+                    CSLDestroy( papszReaderOptions );
                 }
-
-                fprintf( fpOut, "\n" );
-
-                //  Reset the options
-                papszReaderOptions = CSLSetNameValue( papszReaderOptions, S57O_RETURN_PRIMITIVES,
-                        "OFF" );
-                poReader->SetOptions( papszReaderOptions );
-                CSLDestroy( papszReaderOptions );
 
                 break;
             }
@@ -5182,6 +6179,10 @@ void s57chart::CreateSENCRecord( OGRFeature *pFeature, FILE * fpOut, int mode, S
     }
 }
 
+#endif
+
+
+#if 0
 void s57chart::CreateSENCVectorEdgeTable( FILE * fpOut, S57Reader *poReader )
 {
     fprintf( fpOut, "VETableStart\n" );
@@ -5212,6 +6213,73 @@ void s57chart::CreateSENCVectorEdgeTable( FILE * fpOut, S57Reader *poReader )
                 nPoints = 0;
         }
 
+        //  Transcribe points to a buffer
+
+        if(nPoints){
+            double *ppd = (double *)malloc(nPoints * sizeof(MyPoint));
+            double *ppr = ppd;
+
+            for( int i = 0; i < nPoints; i++ ) {
+                OGRPoint p;
+                pLS->getPoint( i, &p );
+
+            //  Calculate SM from chart common reference point
+                double easting, northing;
+                toSM( p.getY(), p.getX(), ref_lat, ref_lon, &easting, &northing );
+
+                *ppr++ = easting;
+                *ppr++ = northing;
+            }
+
+        //      Reduce the LOD of this linestring
+            wxArrayInt index_keep;
+            if(nPoints > 5 && (m_LOD_meters > .01)){
+                index_keep.Clear();
+                index_keep.Add(0);
+                index_keep.Add(nPoints-1);
+
+                DouglasPeucker(ppd, 0, nPoints-1, m_LOD_meters, &index_keep);
+ //               printf("DP Reduction: %d/%d\n", index_keep.GetCount(), nPoints);
+
+            }
+            else {
+                index_keep.Clear();
+                for(int i = 0 ; i < nPoints ; i++)
+                    index_keep.Add(i);
+            }
+
+            int nPointReduced = index_keep.GetCount();
+
+        //  And make a new array
+            double *npp = (double *)malloc(nPoints * 2 * sizeof(double));
+            double *npp_run = npp;
+            ppr = ppd;
+            for(int ip = 0 ; ip < nPoints ; ip++)
+            {
+                double x = *ppr++;
+                double y = *ppr++;
+
+                for(unsigned int j=0 ; j < index_keep.GetCount() ; j++){
+                    if(index_keep.Item(j) == ip){
+                        *npp_run++ = x;
+                        *npp_run++ = y;
+                        break;
+                    }
+                }
+            }
+
+            fwrite( &nPointReduced, 1, sizeof(int), fpOut );
+
+            fwrite( npp, nPointReduced, sizeof(MyPoint), fpOut );
+
+            free( ppd );
+            free( npp );
+        }
+        else{
+            fwrite( &nPoints, 1, sizeof(int), fpOut );
+        }
+
+#if 0
         fwrite( &nPoints, 1, sizeof(int), fpOut );
 
         for( int i = 0; i < nPoints; i++ ) {
@@ -5227,6 +6295,7 @@ void s57chart::CreateSENCVectorEdgeTable( FILE * fpOut, S57Reader *poReader )
             pd.y = northing;
             fwrite( &pd, 1, sizeof(MyPoint), fpOut );
         }
+#endif
 
         //    Next vector record
         feid++;
@@ -5303,8 +6372,10 @@ void s57chart::CreateSENCConnNodeTable( FILE * fpOut, S57Reader *poReader )
     CSLDestroy( papszReaderOptions );
 }
 
+#endif
+
 ListOfObjRazRules *s57chart::GetObjRuleListAtLatLon( float lat, float lon, float select_radius,
-        ViewPort *VPoint )
+        ViewPort *VPoint, int selection_mask )
 {
 
     ListOfObjRazRules *ret_ptr = new ListOfObjRazRules;
@@ -5314,60 +6385,67 @@ ListOfObjRazRules *s57chart::GetObjRuleListAtLatLon( float lat, float lon, float
     ObjRazRules *top;
 
     for( int i = 0; i < PRIO_NUM; ++i ) {
-        // Points by type, array indices [0..1]
 
-        int point_type = ( ps52plib->m_nSymbolStyle == SIMPLIFIED ) ? 0 : 1;
-        top = razRules[i][point_type];
+        if(selection_mask & MASK_POINT){
+            // Points by type, array indices [0..1]
 
-        while( top != NULL ) {
-            if( top->obj->npt == 1 )       // Do not select Multipoint objects (SOUNDG) yet.
-                    {
-                if( ps52plib->ObjectRenderCheck( top, VPoint ) ) {
-                    if( DoesLatLonSelectObject( lat, lon, select_radius, top->obj ) )
-                        ret_ptr->Append( top );
-                }
-            }
+            int point_type = ( ps52plib->m_nSymbolStyle == SIMPLIFIED ) ? 0 : 1;
+            top = razRules[i][point_type];
 
-            //    Check the child branch, if any.
-            //    This is where Multipoint soundings are captured individually
-            if( top->child ) {
-                ObjRazRules *child_item = top->child;
-                while( child_item != NULL ) {
-                    if( ps52plib->ObjectRenderCheck( child_item, VPoint ) ) {
-                        if( DoesLatLonSelectObject( lat, lon, select_radius, child_item->obj ) )
-                            ret_ptr->Append( child_item );
+            while( top != NULL ) {
+                if( top->obj->npt == 1 )       // Do not select Multipoint objects (SOUNDG) yet.
+                        {
+                    if( ps52plib->ObjectRenderCheck( top, VPoint ) ) {
+                        if( DoesLatLonSelectObject( lat, lon, select_radius, top->obj ) )
+                            ret_ptr->Append( top );
                     }
-
-                    child_item = child_item->next;
                 }
-            }
 
-            top = top->next;
+                //    Check the child branch, if any.
+                //    This is where Multipoint soundings are captured individually
+                if( top->child ) {
+                    ObjRazRules *child_item = top->child;
+                    while( child_item != NULL ) {
+                        if( ps52plib->ObjectRenderCheck( child_item, VPoint ) ) {
+                            if( DoesLatLonSelectObject( lat, lon, select_radius, child_item->obj ) )
+                                ret_ptr->Append( child_item );
+                        }
+
+                        child_item = child_item->next;
+                    }
+                }
+
+                top = top->next;
+            }
         }
 
-        // Areas by boundary type, array indices [3..4]
+        if(selection_mask & MASK_AREA){
+                // Areas by boundary type, array indices [3..4]
 
-        int area_boundary_type = ( ps52plib->m_nBoundaryStyle == PLAIN_BOUNDARIES ) ? 3 : 4;
-        top = razRules[i][area_boundary_type];           // Area nnn Boundaries
-        while( top != NULL ) {
-            if( ps52plib->ObjectRenderCheck( top, VPoint ) ) {
-                if( DoesLatLonSelectObject( lat, lon, select_radius, top->obj ) ) ret_ptr->Append(
-                        top );
+            int area_boundary_type = ( ps52plib->m_nBoundaryStyle == PLAIN_BOUNDARIES ) ? 3 : 4;
+            top = razRules[i][area_boundary_type];           // Area nnn Boundaries
+            while( top != NULL ) {
+                if( ps52plib->ObjectRenderCheck( top, VPoint ) ) {
+                    if( DoesLatLonSelectObject( lat, lon, select_radius, top->obj ) ) ret_ptr->Append(
+                            top );
+                }
+
+                top = top->next;
+            }         // while
+        }
+
+        if(selection_mask & MASK_LINE){
+                // Finally, lines
+            top = razRules[i][2];           // Lines
+
+            while( top != NULL ) {
+                if( ps52plib->ObjectRenderCheck( top, VPoint ) ) {
+                    if( DoesLatLonSelectObject( lat, lon, select_radius, top->obj ) ) ret_ptr->Append(
+                            top );
+                }
+
+                top = top->next;
             }
-
-            top = top->next;
-        }         // while
-
-        // Finally, lines
-        top = razRules[i][2];           // Lines
-
-        while( top != NULL ) {
-            if( ps52plib->ObjectRenderCheck( top, VPoint ) ) {
-                if( DoesLatLonSelectObject( lat, lon, select_radius, top->obj ) ) ret_ptr->Append(
-                        top );
-            }
-
-            top = top->next;
         }
     }
 
@@ -5380,6 +6458,8 @@ bool s57chart::DoesLatLonSelectObject( float lat, float lon, float select_radius
         //  For single Point objects, the integral object bounding box contains the lat/lon of the object,
         //  possibly expanded by text or symbol rendering
         case GEO_POINT: {
+            if( !obj->BBObj.GetValid() ) return false;
+
             if( 1 == obj->npt ) {
                 //  Special case for LIGHTS
                 //  Sector lights have had their BBObj expanded to include the entire drawn sector
@@ -5394,29 +6474,30 @@ bool s57chart::DoesLatLonSelectObject( float lat, float lon, float select_radius
                     // Double the select radius to adjust for the fact that LIGHTS has
                     // a 0x0 BBox to start with, which makes it smaller than all other
                     // rendered objects.
-                    wxBoundingBox sbox( olon - 2*select_radius, olat - 2*select_radius,
-                            olon + 2*select_radius, olat + 2*select_radius );
+                    LLBBox sbox;
+                    sbox.Set(olat, olon, olat, olon);
 
-                    if( sbox.PointInBox( lon, lat, 0 ) ) return true;
+                    if( sbox.ContainsMarge( lat, lon, select_radius ) ) return true;
                 }
 
-                else if( obj->BBObj.PointInBox( lon, lat, select_radius ) ) return true;
+                else if( obj->BBObj.ContainsMarge( lat, lon, select_radius ) ) return true;
             }
 
             //  For MultiPoint objects, make a bounding box from each point's lat/lon
             //  and check it
             else {
-                if( !obj->bBBObj_valid ) return false;
+                if( !obj->BBObj.GetValid() ) return false;
 
                 //  Coarse test first
-                if( !obj->BBObj.PointInBox( lon, lat, select_radius ) ) return false;
+                if( !obj->BBObj.ContainsMarge( lat, lon, select_radius ) ) return false;
                 //  Now decomposed soundings, one by one
                 double *pdl = obj->geoPtMulti;
                 for( int ip = 0; ip < obj->npt; ip++ ) {
                     double lon_point = *pdl++;
                     double lat_point = *pdl++;
-                    wxBoundingBox BB_point( lon_point, lat_point, lon_point, lat_point );
-                    if( BB_point.PointInBox( lon, lat, select_radius ) ) {
+                    LLBBox BB_point;
+                    BB_point.Set( lat_point, lon_point, lat_point, lon_point );
+                    if( BB_point.ContainsMarge( lat, lon, select_radius ) ) {
 //                                  index = ip;
                         return true;
                     }
@@ -5427,7 +6508,7 @@ bool s57chart::DoesLatLonSelectObject( float lat, float lon, float select_radius
         }
         case GEO_AREA: {
             //  Coarse test first
-            if( !obj->BBObj.PointInBox( lon, lat, select_radius ) ) return false;
+            if( !obj->BBObj.ContainsMarge( lat, lon, select_radius ) ) return false;
             else
                 return IsPointInObjArea( lat, lon, select_radius, obj );
         }
@@ -5435,14 +6516,25 @@ bool s57chart::DoesLatLonSelectObject( float lat, float lon, float select_radius
         case GEO_LINE: {
             if( obj->geoPt ) {
                 //  Coarse test first
-                if( !obj->BBObj.PointInBox( lon, lat, select_radius ) ) return false;
+                if( !obj->BBObj.ContainsMarge( lat, lon, select_radius ) ) return false;
 
                 //  Line geometry is carried in SM or CM93 coordinates, so...
                 //  make the hit test using SM coordinates, converting from object points to SM using per-object conversion factors.
 
+                float sel_rad_meters = select_radius * 1852 * 60;       // approximately
+
                 double easting, northing;
                 toSM( lat, lon, ref_lat, ref_lon, &easting, &northing );
+                
+#if 0
+                float *ptest;
+                int ntp = GetLineFeaturePointArray(obj, (void **) &ptest);
 
+                if(!ntp)
+                    return false;
+
+                float *pfree = ptest;
+#endif
                 pt *ppt = obj->geoPt;
                 int npt = obj->npt;
 
@@ -5453,18 +6545,31 @@ bool s57chart::DoesLatLonSelectObject( float lat, float lon, float select_radius
 
                 double north0 = ( ppt->y * yr ) + yo;
                 double east0 = ( ppt->x * xr ) + xo;
+#if 0
+                float a0 = *ptest++;
+                float b0 = *ptest++;
+#endif
                 ppt++;
 
                 for( int ip = 1; ip < npt; ip++ ) {
+#if 0
+                    float a = *ptest++;
+                    float b = *ptest++;
+                    float c = ppt->y;
+                    float d = ppt->x;
+                    printf("%g %g %g %g\n", a,b,c,d);
+#endif
+
                     double north = ( ppt->y * yr ) + yo;
                     double east = ( ppt->x * xr ) + xo;
 
                     //    A slightly less coarse segment bounding box check
-                    if( northing >= ( fmin(north, north0) - select_radius ) ) if( northing
-                            <= ( fmax(north, north0) + select_radius ) ) if( easting
-                            >= ( fmin(east, east0) - select_radius ) ) if( easting
-                            <= ( fmax(east, east0) + select_radius ) ) {
+                    if( northing >= ( fmin(north, north0) - sel_rad_meters ) ) if( northing
+                        <= ( fmax(north, north0) + sel_rad_meters ) ) if( easting
+                        >= ( fmin(east, east0) - sel_rad_meters ) ) if( easting
+                        <= ( fmax(east, east0) + sel_rad_meters ) ) {
                         //                                                    index = ip;
+                        //free (pfree);
                         return true;
                     }
 
@@ -5472,6 +6577,7 @@ bool s57chart::DoesLatLonSelectObject( float lat, float lon, float select_radius
                     east0 = east;
                     ppt++;
                 }
+                //free (pfree);
             }
 
             break;
@@ -5490,20 +6596,10 @@ wxString s57chart::GetAttributeDecode( wxString& att, int ival )
 {
     wxString ret_val = _T("");
 
-    //    Special case for "NATSUR", cacheing the strings for faster chart rendering
-    if( att.IsSameAs( _T("NATSUR") ) ) {
-        if( !m_natsur_hash[ival].IsEmpty() )            // entry available?
-        {
-            return m_natsur_hash[ival];
-        }
-    }
-
-    if( NULL == m_pcsv_locn ) return ret_val;
-
     //  Get the attribute code from the acronym
     const char *att_code;
 
-    wxString file( *m_pcsv_locn );
+    wxString file( g_csv_locn );
     file.Append( _T("/s57attributes.csv") );
 
     if( !wxFileName::FileExists( file ) ) {
@@ -5522,7 +6618,7 @@ wxString s57chart::GetAttributeDecode( wxString& att, int ival )
     //  This will have to be a 2-d search, using ID field and Code field
 
     // Ingest, and get a pointer to the ingested table for "Expected Input" file
-    wxString ei_file( *m_pcsv_locn );
+    wxString ei_file( g_csv_locn );
     ei_file.Append( _T("/s57expectedinput.csv") );
 
     if( !wxFileName::FileExists( ei_file ) ) {
@@ -5557,8 +6653,6 @@ wxString s57chart::GetAttributeDecode( wxString& att, int ival )
         CSLDestroy( papszFields );
     }
 
-    if( att.IsSameAs( _T("NATSUR") ) ) m_natsur_hash[ival] = ret_val;            // cache the entry
-
     return ret_val;
 
 }
@@ -5570,7 +6664,8 @@ bool s57chart::IsPointInObjArea( float lat, float lon, float select_radius, S57O
     bool ret = false;
 
     if( obj->pPolyTessGeo ) {
-        if( !obj->pPolyTessGeo->IsOk() ) obj->pPolyTessGeo->BuildTessGL();
+        if( !obj->pPolyTessGeo->IsOk() )
+            obj->pPolyTessGeo->BuildDeferredTess();
 
         PolyTriGroup *ppg = obj->pPolyTessGeo->Get_PolyTriGroup_head();
 
@@ -5599,66 +6694,128 @@ bool s57chart::IsPointInObjArea( float lat, float lon, float select_radius, S57O
 
         while( pTP ) {
 //  Coarse test
-            if( pTP->p_bbox->PointInBox( lon, lat, 0 ) ) {
-                double *p_vertex = pTP->p_vertex;
+            if( pTP->box.Contains( lat, lon ) ) {
 
-                switch( pTP->type ){
-                    case PTG_TRIANGLE_FAN: {
-                        for( int it = 0; it < pTP->nVert - 2; it++ ) {
-                            pvert_list[0].x = p_vertex[0];
-                            pvert_list[0].y = p_vertex[1];
+                if(ppg->data_type == DATA_TYPE_DOUBLE) {
+                    double *p_vertex = pTP->p_vertex;
 
-                            pvert_list[1].x = p_vertex[( it * 2 ) + 2];
-                            pvert_list[1].y = p_vertex[( it * 2 ) + 3];
+                    switch( pTP->type ){
+                        case PTG_TRIANGLE_FAN: {
+                            for( int it = 0; it < pTP->nVert - 2; it++ ) {
+                                pvert_list[0].x = p_vertex[0];
+                                pvert_list[0].y = p_vertex[1];
 
-                            pvert_list[2].x = p_vertex[( it * 2 ) + 4];
-                            pvert_list[2].y = p_vertex[( it * 2 ) + 5];
+                                pvert_list[1].x = p_vertex[( it * 2 ) + 2];
+                                pvert_list[1].y = p_vertex[( it * 2 ) + 3];
 
-                            if( G_PtInPolygon( (MyPoint *) pvert_list, 3, easting, northing ) ) {
-                                ret = true;
-                                break;
+                                pvert_list[2].x = p_vertex[( it * 2 ) + 4];
+                                pvert_list[2].y = p_vertex[( it * 2 ) + 5];
+
+                                if( G_PtInPolygon( (MyPoint *) pvert_list, 3, easting, northing ) ) {
+                                    ret = true;
+                                    break;
+                                }
                             }
+                            break;
                         }
-                        break;
-                    }
-                    case PTG_TRIANGLE_STRIP: {
-                        for( int it = 0; it < pTP->nVert - 2; it++ ) {
-                            pvert_list[0].x = p_vertex[( it * 2 )];
-                            pvert_list[0].y = p_vertex[( it * 2 ) + 1];
+                        case PTG_TRIANGLE_STRIP: {
+                            for( int it = 0; it < pTP->nVert - 2; it++ ) {
+                                pvert_list[0].x = p_vertex[( it * 2 )];
+                                pvert_list[0].y = p_vertex[( it * 2 ) + 1];
 
-                            pvert_list[1].x = p_vertex[( it * 2 ) + 2];
-                            pvert_list[1].y = p_vertex[( it * 2 ) + 3];
+                                pvert_list[1].x = p_vertex[( it * 2 ) + 2];
+                                pvert_list[1].y = p_vertex[( it * 2 ) + 3];
 
-                            pvert_list[2].x = p_vertex[( it * 2 ) + 4];
-                            pvert_list[2].y = p_vertex[( it * 2 ) + 5];
+                                pvert_list[2].x = p_vertex[( it * 2 ) + 4];
+                                pvert_list[2].y = p_vertex[( it * 2 ) + 5];
 
-                            if( G_PtInPolygon( (MyPoint *) pvert_list, 3, easting, northing ) ) {
-                                ret = true;
-                                break;
+                                if( G_PtInPolygon( (MyPoint *) pvert_list, 3, easting, northing ) ) {
+                                    ret = true;
+                                    break;
+                                }
                             }
+                            break;
                         }
-                        break;
-                    }
-                    case PTG_TRIANGLES: {
-                        for( int it = 0; it < pTP->nVert; it += 3 ) {
-                            pvert_list[0].x = p_vertex[( it * 2 )];
-                            pvert_list[0].y = p_vertex[( it * 2 ) + 1];
+                        case PTG_TRIANGLES: {
+                            for( int it = 0; it < pTP->nVert; it += 3 ) {
+                                pvert_list[0].x = p_vertex[( it * 2 )];
+                                pvert_list[0].y = p_vertex[( it * 2 ) + 1];
 
-                            pvert_list[1].x = p_vertex[( it * 2 ) + 2];
-                            pvert_list[1].y = p_vertex[( it * 2 ) + 3];
+                                pvert_list[1].x = p_vertex[( it * 2 ) + 2];
+                                pvert_list[1].y = p_vertex[( it * 2 ) + 3];
 
-                            pvert_list[2].x = p_vertex[( it * 2 ) + 4];
-                            pvert_list[2].y = p_vertex[( it * 2 ) + 5];
+                                pvert_list[2].x = p_vertex[( it * 2 ) + 4];
+                                pvert_list[2].y = p_vertex[( it * 2 ) + 5];
 
-                            if( G_PtInPolygon( (MyPoint *) pvert_list, 3, easting, northing ) ) {
-                                ret = true;
-                                break;
+                                if( G_PtInPolygon( (MyPoint *) pvert_list, 3, easting, northing ) ) {
+                                    ret = true;
+                                    break;
+                                }
                             }
+                            break;
                         }
-                        break;
                     }
                 }
+                else {
+                    float *p_vertex = (float *)pTP->p_vertex;
 
+                    switch( pTP->type ){
+                        case PTG_TRIANGLE_FAN: {
+                            for( int it = 0; it < pTP->nVert - 2; it++ ) {
+                                pvert_list[0].x = p_vertex[0];
+                                pvert_list[0].y = p_vertex[1];
+
+                                pvert_list[1].x = p_vertex[( it * 2 ) + 2];
+                                pvert_list[1].y = p_vertex[( it * 2 ) + 3];
+
+                                pvert_list[2].x = p_vertex[( it * 2 ) + 4];
+                                pvert_list[2].y = p_vertex[( it * 2 ) + 5];
+
+                                if( G_PtInPolygon( (MyPoint *) pvert_list, 3, easting, northing ) ) {
+                                    ret = true;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                        case PTG_TRIANGLE_STRIP: {
+                            for( int it = 0; it < pTP->nVert - 2; it++ ) {
+                                pvert_list[0].x = p_vertex[( it * 2 )];
+                                pvert_list[0].y = p_vertex[( it * 2 ) + 1];
+
+                                pvert_list[1].x = p_vertex[( it * 2 ) + 2];
+                                pvert_list[1].y = p_vertex[( it * 2 ) + 3];
+
+                                pvert_list[2].x = p_vertex[( it * 2 ) + 4];
+                                pvert_list[2].y = p_vertex[( it * 2 ) + 5];
+
+                                if( G_PtInPolygon( (MyPoint *) pvert_list, 3, easting, northing ) ) {
+                                    ret = true;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                        case PTG_TRIANGLES: {
+                            for( int it = 0; it < pTP->nVert; it += 3 ) {
+                                pvert_list[0].x = p_vertex[( it * 2 )];
+                                pvert_list[0].y = p_vertex[( it * 2 ) + 1];
+
+                                pvert_list[1].x = p_vertex[( it * 2 ) + 2];
+                                pvert_list[1].y = p_vertex[( it * 2 ) + 3];
+
+                                pvert_list[2].x = p_vertex[( it * 2 ) + 4];
+                                pvert_list[2].y = p_vertex[( it * 2 ) + 5];
+
+                                if( G_PtInPolygon( (MyPoint *) pvert_list, 3, easting, northing ) ) {
+                                    ret = true;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
             }
             pTP = pTP->p_next;
         }
@@ -5676,22 +6833,33 @@ bool s57chart::IsPointInObjArea( float lat, float lon, float select_radius, S57O
         double easting, northing;
         toSM( lat, lon, ref_lat, ref_lon, &easting, &northing );
 
+        //  It turns out that trapezoid tesselation is only used for cm93,
+        //  So we get better accuracy if we use the cell-referenced points instead of global SM points
+        {
+            double y_rate = obj->y_rate;
+            double y_origin = obj->y_origin;
+            double x_rate = obj->x_rate;
+            double x_origin = obj->x_origin;
+
+            double northing_scaled = ( northing - y_origin ) / y_rate;
+            double easting_scaled = ( easting - x_origin ) / x_rate;
+            northing = northing_scaled;
+            easting = easting_scaled;
+        }
+
         int ntraps = ptg->ntrap_count;
         trapz_t *ptraps = ptg->trap_array;
         MyPoint *segs = (MyPoint *) ptg->ptrapgroup_geom; //TODO convert MyPoint to wxPoint2DDouble globally
 
         MyPoint pvert_list[4];
 
-        double y_rate = obj->y_rate;
-        double y_origin = obj->y_origin;
-
         for( int i = 0; i < ntraps; i++, ptraps++ ) {
             //      Y test
 
-            double hiy = ( ptraps->hiy * y_rate ) + y_origin;
+            double hiy = ptraps->hiy;
             if( northing > hiy ) continue;
 
-            double loy = ( ptraps->loy * y_rate ) + y_origin;
+            double loy = ptraps->loy;
             if( northing < loy ) continue;
 
             //      Use the segment endpoints to calculate the corners of a trapezoid
@@ -5725,10 +6893,15 @@ bool s57chart::IsPointInObjArea( float lat, float lon, float select_radius, S57O
                 xcb = xmin + ( ptraps->hiy - ymin ) / slope;
             }
 
-            pvert_list[0].x = ( xca * obj->x_rate ) + obj->x_origin;
+            //  Test point is west of leftmost trap point
+            double x_quad_left = wxMin(xca, xcb);
+            if( x_quad_left > easting )
+                continue;
+
+            pvert_list[0].x = xca;
             pvert_list[0].y = loy;
 
-            pvert_list[1].x = ( xcb * obj->x_rate ) + obj->x_origin;
+            pvert_list[1].x = xcb;
             pvert_list[1].y = hiy;
 
             //    Right edge
@@ -5755,10 +6928,15 @@ bool s57chart::IsPointInObjArea( float lat, float lon, float select_radius, S57O
                 xcb = xmin + ( ptraps->loy - ymin ) / slope;
             }
 
-            pvert_list[2].x = ( xca * obj->x_rate ) + obj->x_origin;
+            //  Test point is east of rightmost trap point
+            double x_quad_right = wxMax(xca, xcb);
+            if( x_quad_right < easting )
+                continue;
+
+            pvert_list[2].x = xca;
             pvert_list[2].y = hiy;
 
-            pvert_list[3].x = ( xcb * obj->x_rate ) + obj->x_origin;
+            pvert_list[3].x = xcb;
             pvert_list[3].y = loy;
 
             if( G_PtInPolygon( (MyPoint *) pvert_list, 4, easting, northing ) ) {
@@ -5771,103 +6949,6 @@ bool s57chart::IsPointInObjArea( float lat, float lon, float select_radius, S57O
     return ret;
 }
 
-//------------------------------------------------------------------------
-//
-//          Minimally initialize an S57 chart from a prebuilt SENC file
-//          Mainly used to get extents, scale, etc from SENC header
-//
-//------------------------------------------------------------------------
-bool s57chart::InitFromSENCMinimal( const wxString &FullPath )
-{
-    bool ret_val = true;
-    int check_val = 0;
-
-    m_FullPath = FullPath;
-    m_Description = m_FullPath;
-
-    wxFileName S57FileName( FullPath );
-
-    if( !S57FileName.FileExists() ) return false;
-
-    wxFile f;
-    if( f.Open( S57FileName.GetFullPath() ) ) {
-        if( f.Length() == 0 ) {
-            f.Close();
-            ret_val = false;
-        } else                                      // file exists, non-zero
-        {                                         // so check for new updates
-
-            f.Seek( 0 );
-            wxFileInputStream *pfpx_u = new wxFileInputStream( f );
-            wxBufferedInputStream *pfpx = new wxBufferedInputStream( *pfpx_u );
-            int dun = 0;
-            int last_update = 0;
-            int senc_file_version = 0;
-            char buf[256];
-            char *pbuf = buf;
-
-            while( !dun ) {
-                if( my_fgets( pbuf, 256, *pfpx ) == 0 ) {
-                    dun = 1;
-                    ret_val = false;
-                    break;
-                } else {
-                    if( !strncmp( pbuf, "OGRF", 4 ) ) {
-                        dun = 1;
-                        break;
-                    } else if( !strncmp( pbuf, "UPDT", 4 ) ) {
-                        sscanf( pbuf, "UPDT=%i", &last_update );
-                    } else if( !strncmp( pbuf, "SENC", 4 ) ) {
-                        sscanf( pbuf, "SENC Version=%i", &senc_file_version );
-                    } else if( !strncmp( pbuf, "Chart Extents:", 13 ) ) {
-                        double xmin, ymin, xmax, ymax;
-                        wxString l( pbuf, wxConvUTF8 );
-
-                        wxStringTokenizer tkz( l, _T(" ") );
-                        wxString token = tkz.GetNextToken();  //Chart
-                        token = tkz.GetNextToken();           //Extents:
-
-                        token = tkz.GetNextToken();
-                        token.ToDouble( &xmax );
-                        token = tkz.GetNextToken();
-                        token.ToDouble( &xmin );
-                        token = tkz.GetNextToken();
-                        token.ToDouble( &ymax );
-                        token = tkz.GetNextToken();
-                        token.ToDouble( &ymin );
-
-                        Extent ext;
-                        ext.WLON = xmin;
-                        ext.SLAT = ymin;
-                        ext.ELON = xmax;
-                        ext.NLAT = ymax;
-                        SetFullExtent( ext );
-
-                        check_val |= 1;
-                    } else if( !strncmp( pbuf, "SCALE=", 6 ) ) {
-                        int scale;
-                        sscanf( pbuf, "SCALE=%i", &scale );
-                        m_Chart_Scale = scale;
-                        check_val |= 2;
-                    }
-
-                }
-            }
-
-            delete pfpx;
-            delete pfpx_u;
-            f.Close();
-        }
-    } else
-        ret_val = false;                // file did not open
-
-    if( false == ret_val ) return false;                   // some other read problem
-
-    if( 3 != check_val ) return false;                   // did not get all required parameters
-
-    return true;
-
-}
 
 wxString s57chart::GetObjectAttributeValueAsString( S57Obj *obj, int iatt, wxString curAttrName )
 {
@@ -5881,42 +6962,54 @@ wxString s57chart::GetObjectAttributeValueAsString( S57Obj *obj, int iatt, wxStr
                 wxString val_str( (char *) ( pval->value ), wxConvUTF8 );
                 long ival;
                 if( val_str.ToLong( &ival ) ) {
-                    if( 0 == ival ) value = _T("Unknown");
+                    if( 0 == ival )
+                        value = _T("Unknown");
                     else {
                         wxString decode_val = GetAttributeDecode( curAttrName, ival );
                         if( !decode_val.IsEmpty() ) {
                             value = decode_val;
                             wxString iv;
-                            iv.Printf( _T("(%d)"), (int) ival );
+                            iv.Printf( _T(" (%d)"), (int) ival );
                             value.Append( iv );
                         } else
                             value.Printf( _T("%d"), (int) ival );
                     }
                 }
 
-                else if( val_str.IsEmpty() ) value = _T("Unknown");
+                else if( val_str.IsEmpty() )
+                    value = _T("Unknown");
 
                 else {
                     value.Clear();
                     wxString value_increment;
                     wxStringTokenizer tk( val_str, wxT(",") );
                     int iv = 0;
-                    while( tk.HasMoreTokens() ) {
-                        wxString token = tk.GetNextToken();
-                        long ival;
-                        if( token.ToLong( &ival ) ) {
-                            wxString decode_val = GetAttributeDecode( curAttrName, ival );
-                            if( !decode_val.IsEmpty() ) value_increment = decode_val;
-                            else
-                                value_increment.Printf( _T(" %d"), (int) ival );
+                    if( tk.HasMoreTokens() ) {
+                        while( tk.HasMoreTokens() ) {
+                            wxString token = tk.GetNextToken();
+                            long ival;
+                            if( token.ToLong( &ival ) ) {
+                                wxString decode_val = GetAttributeDecode( curAttrName, ival );
 
-                            if( iv ) value_increment.Prepend( wxT(", ") );
+                                value_increment.Printf( _T(" (%d)"), (int) ival );
+
+                                if( !decode_val.IsEmpty() )
+                                    value_increment.Prepend(decode_val);
+
+                                if( iv ) value_increment.Prepend( wxT(", ") );
+                                value.Append( value_increment );
+
+                            }
+                            else{
+                                if(iv) value.Append(_T(","));
+                                value.Append( token );
+                            }
+
+                            iv++;
                         }
-                        value.Append( value_increment );
-
-                        iv++;
                     }
-                    value.Append( val_str );
+                    else
+                        value.Append( val_str );
                 }
             } else
                 value = _T("[NULL VALUE]");
@@ -5946,7 +7039,7 @@ wxString s57chart::GetObjectAttributeValueAsString( S57Obj *obj, int iatt, wxStr
             wxString val_suffix = _T(" m");
 
             //    As a special case, convert some attribute values to feet.....
-            if( ( curAttrName == _T("VERCLR") ) || ( curAttrName == _T("VERCLL") )
+            if( ( curAttrName == _T("VERCLR") ) || ( curAttrName == _T("VERCCL") ) || ( curAttrName == _T("VERCOP") )
                     || ( curAttrName == _T("HEIGHT") ) || ( curAttrName == _T("HORCLR") ) ) {
                 switch( ps52plib->m_nDepthUnitDisplay ){
                     case 0:                       // feet
@@ -5960,7 +7053,7 @@ wxString s57chart::GetObjectAttributeValueAsString( S57Obj *obj, int iatt, wxStr
             }
 
             else if( ( curAttrName == _T("VALSOU") ) || ( curAttrName == _T("DRVAL1") )
-                    || ( curAttrName == _T("DRVAL2") ) ) {
+                    || ( curAttrName == _T("DRVAL2") ) || ( curAttrName == _T("VALDCO") ) ) {
                 switch( ps52plib->m_nDepthUnitDisplay ){
                     case 0:                       // feet
                         dval = dval * 3 * 39.37 / 36;              // feet
@@ -5981,6 +7074,9 @@ wxString s57chart::GetObjectAttributeValueAsString( S57Obj *obj, int iatt, wxStr
             else if( curAttrName == _T("ORIENT") ) val_suffix = _T("&deg;");
             else if( curAttrName == _T("VALNMR") ) val_suffix = _T(" Nm");
             else if( curAttrName == _T("SIGPER") ) val_suffix = _T("s");
+            else if( curAttrName == _T("VALACM") ) val_suffix = _T(" Minutes/year");
+            else if( curAttrName == _T("VALMAG") ) val_suffix = _T("&deg;");
+            else if( curAttrName == _T("CURVEL") ) val_suffix = _T(" kt");
 
             if( dval - floor( dval ) < 0.01 ) value.Printf( _T("%2.0f"), dval );
             else
@@ -5994,6 +7090,139 @@ wxString s57chart::GetObjectAttributeValueAsString( S57Obj *obj, int iatt, wxStr
         case OGR_REAL_LST: {
             break;
         }
+    }
+    return value;
+}
+
+wxString s57chart::GetAttributeValueAsString( S57attVal *pAttrVal, wxString AttrName )
+{
+    if(NULL == pAttrVal)
+        return _T("");
+
+    wxString value;
+    switch( pAttrVal->valType ){
+        case OGR_STR: {
+            if( pAttrVal->value ) {
+                wxString val_str( (char *) ( pAttrVal->value ), wxConvUTF8 );
+                long ival;
+                if( val_str.ToLong( &ival ) ) {
+                    if( 0 == ival )
+                        value = _T("Unknown");
+                    else {
+                        wxString decode_val = GetAttributeDecode( AttrName, ival );
+                        if( !decode_val.IsEmpty() ) {
+                            value = decode_val;
+                            wxString iv;
+                            iv.Printf( _T("(%d)"), (int) ival );
+                            value.Append( iv );
+                        } else
+                            value.Printf( _T("%d"), (int) ival );
+                    }
+                }
+
+                else if( val_str.IsEmpty() ) value = _T("Unknown");
+
+                else {
+                    value.Clear();
+                    wxString value_increment;
+                    wxStringTokenizer tk( val_str, wxT(",") );
+                    int iv = 0;
+                    while( tk.HasMoreTokens() ) {
+                        wxString token = tk.GetNextToken();
+                        long ival;
+                        if( token.ToLong( &ival ) ) {
+                            wxString decode_val = GetAttributeDecode( AttrName, ival );
+                            if( !decode_val.IsEmpty() ) value_increment = decode_val;
+                            else
+                                value_increment.Printf( _T(" %d"), (int) ival );
+
+                            if( iv ) value_increment.Prepend( wxT(", ") );
+                        }
+                        value.Append( value_increment );
+
+                        iv++;
+                    }
+                    value.Append( val_str );
+                }
+            } else
+                value = _T("[NULL VALUE]");
+
+            break;
+        }
+
+        case OGR_INT: {
+            int ival = *( (int *) pAttrVal->value );
+            wxString decode_val = GetAttributeDecode( AttrName, ival );
+
+            if( !decode_val.IsEmpty() ) {
+                value = decode_val;
+                wxString iv;
+                iv.Printf( _T("(%d)"), ival );
+                value.Append( iv );
+            } else
+                value.Printf( _T("(%d)"), ival );
+
+            break;
+        }
+        case OGR_INT_LST:
+            break;
+
+        case OGR_REAL: {
+            double dval = *( (double *) pAttrVal->value );
+            wxString val_suffix = _T(" m");
+
+            //    As a special case, convert some attribute values to feet.....
+            if( ( AttrName == _T("VERCLR") ) || ( AttrName == _T("VERCCL") ) || ( AttrName == _T("VERCOP") )
+                || ( AttrName == _T("HEIGHT") ) || ( AttrName == _T("HORCLR") ) ) {
+                    switch( ps52plib->m_nDepthUnitDisplay ){
+                        case 0:                       // feet
+                        case 2:                       // fathoms
+                        dval = dval * 3 * 39.37 / 36;              // feet
+                        val_suffix = _T(" ft");
+                        break;
+                        default:
+                            break;
+                    }
+                }
+
+                else if( ( AttrName == _T("VALSOU") ) || ( AttrName == _T("DRVAL1") )
+                    || ( AttrName == _T("DRVAL2") ) ) {
+                    switch( ps52plib->m_nDepthUnitDisplay ){
+                        case 0:                       // feet
+                        dval = dval * 3 * 39.37 / 36;              // feet
+                        val_suffix = _T(" ft");
+                        break;
+                        case 2:                       // fathoms
+                        dval = dval * 3 * 39.37 / 36;              // fathoms
+                        dval /= 6.0;
+                        val_suffix = _T(" fathoms");
+                        break;
+                        default:
+                            break;
+                    }
+                }
+
+                else if( AttrName == _T("SECTR1") ) val_suffix = _T("&deg;");
+                else if( AttrName == _T("SECTR2") ) val_suffix = _T("&deg;");
+                else if( AttrName == _T("ORIENT") ) val_suffix = _T("&deg;");
+                else if( AttrName == _T("VALNMR") ) val_suffix = _T(" Nm");
+                else if( AttrName == _T("SIGPER") ) val_suffix = _T("s");
+                else if( AttrName == _T("VALACM") ) val_suffix = _T(" Minutes/year");
+                else if( AttrName == _T("VALMAG") ) val_suffix = _T("&deg;");
+                else if( AttrName == _T("CURVEL") ) val_suffix = _T(" kt");
+
+               if( dval - floor( dval ) < 0.01 ) value.Printf( _T("%2.0f"), dval );
+               else
+                   value.Printf( _T("%4.1f"), dval );
+
+               value << val_suffix;
+
+               break;
+        }
+
+                        case OGR_REAL_LST: {
+                            break;
+                        }
     }
     return value;
 }
@@ -6023,10 +7252,32 @@ int s57chart::CompareLights( const void** l1ptr, const void** l2ptr )
     return -1;
 }
 
+static const char *type2str( GeoPrim_t type)
+{
+    const char *r = "Uknown";
+    switch(type) {
+    case GEO_POINT:
+        return "Point";
+        break;
+    case GEO_LINE:
+        return "Line";
+        break;
+    case GEO_AREA:
+        return "Area";
+        break;
+    case GEO_META:
+        return "Meta";
+        break;
+    case GEO_PRIM:
+        return "Prim";
+        break;
+    }
+    return r;
+}
+
 wxString s57chart::CreateObjDescriptions( ListOfObjRazRules* rule_list )
 {
     wxString ret_val;
-    char *curr_att;
     int attrCounter;
     wxString curAttrName, value;
     bool isLight = false;
@@ -6037,7 +7288,7 @@ wxString s57chart::CreateObjDescriptions( ListOfObjRazRules* rule_list )
     wxString lightsHtml;
     wxString positionString;
     wxArrayPtrVoid lights;
-    S57Light* curLight;
+    S57Light* curLight = NULL;
 
     for( ListOfObjRazRules::Node *node = rule_list->GetLast(); node; node = node->GetPrevious() ) {
         ObjRazRules *current = node->GetData();
@@ -6059,8 +7310,8 @@ wxString s57chart::CreateObjDescriptions( ListOfObjRazRules* rule_list )
         //    using cpl_csv from the gdal library
 
         const char *name_desc;
-        if( NULL != m_pcsv_locn ) {
-            wxString oc_file( *m_pcsv_locn );
+        if( g_csv_locn.Len() ) {
+            wxString oc_file( g_csv_locn );
             oc_file.Append( _T("/s57objectclasses.csv") );
             name_desc = MyCSVGetField( oc_file.mb_str(), "Acronym",                  // match field
                     current->obj->FeatureName,            // match value
@@ -6080,21 +7331,32 @@ wxString s57chart::CreateObjDescriptions( ListOfObjRazRules* rule_list )
         //    Show LUP
         if( g_bDebugS57 ) {
             wxString index;
-            index.Printf( _T("Feature Index: %d\n"), current->obj->Index );
+
+            classAttributes = _T("");
+            index.Printf( _T("Feature Index: %d<br>"), current->obj->Index );
             classAttributes << index;
 
             wxString LUPstring;
-            LUPstring.Printf( _T("LUP RCID:  %d\n"), current->LUP->RCID );
+            LUPstring.Printf( _T("LUP RCID:  %d<br>"), current->LUP->RCID );
             classAttributes << LUPstring;
+
+            wxString Bbox;
+            LLBBox bbox = current->obj->BBObj;
+            Bbox.Printf( _T("Lat/Lon box:  %g %g %g %g<br>"), bbox.GetMinLat(), bbox.GetMaxLat() , bbox.GetMinLon(), bbox.GetMaxLon() );
+            classAttributes << Bbox;
+
+            wxString Type;
+            Type.Printf( _T(" Type:  %s<br>"), type2str(current->obj->Primitive_type));
+            classAttributes << Type;
 
             LUPstring = _T("    LUP ATTC: ");
             if( current->LUP->ATTCArray ) LUPstring += current->LUP->ATTCArray->Item( 0 );
-            LUPstring += _T("\n");
+            LUPstring += _T("<br>");
             classAttributes << LUPstring;
 
             LUPstring = _T("    LUP INST: ");
             if( current->LUP->INST ) LUPstring += *( current->LUP->INST );
-            LUPstring += _T("\n\n");
+            LUPstring += _T("<br><br>");
             classAttributes << LUPstring;
 
         }
@@ -6120,96 +7382,92 @@ wxString s57chart::CreateObjDescriptions( ListOfObjRazRules* rule_list )
             }
         }
 
-        //    Get the Attributes and values
+        //    Get the Attributes and values, making sure they can be converted from UTF8
+        if(current->obj->att_array) {
+            char *curr_att = current->obj->att_array;
 
-        char *curr_att0 = (char *) calloc( current->obj->attList->Len() + 1, 1 );
-        strncpy( curr_att0, current->obj->attList->mb_str(), current->obj->attList->Len() );
-        curr_att = curr_att0;
+            attrCounter = 0;
 
-        attrCounter = 0;
+            wxString attribStr;
+            int noAttr = 0;
+            attribStr << _T("<table border=0 cellspacing=0 cellpadding=0>");
 
-        wxString attribStr;
-        int noAttr = 0;
-        attribStr << _T("<table border=0 cellspacing=0 cellpadding=0>");
-
-        bool inDepthRange = false;
-
-        while( *curr_att ) {
-            //    Attribute name
-            curAttrName.Clear();
-            noAttr++;
-            while( ( *curr_att ) && ( *curr_att != '\037' ) ) {
-                char t = *curr_att++;
-                curAttrName.Append( t );
+            if( g_bDebugS57 ) {
+                ret_val << _T("<p>") << classAttributes;
             }
 
-            if( *curr_att == '\037' ) curr_att++;
+            bool inDepthRange = false;
 
-            // Sort out how some kinds of attibutes are displayed to get a more readable look.
-            // DEPARE gets just its range. Lights are grouped.
+            while( attrCounter < current->obj->n_attr ) {
+                //    Attribute name
+                curAttrName = wxString(curr_att, wxConvUTF8, 6);
+                noAttr++;
 
-            if( isLight ) {
-                curLight->attributeNames.Add( curAttrName );
-                if( curAttrName.StartsWith( _T("SECTR") ) ) curLight->hasSectors = true;
-            } else {
-                if( curAttrName == _T("DRVAL1") ) {
-                    attribStr << _T("<tr><td><font size=-1>");
-                    inDepthRange = true;
-                } else if( curAttrName == _T("DRVAL2") ) {
-                    attribStr << _T(" - ");
-                    inDepthRange = false;
+                // Sort out how some kinds of attibutes are displayed to get a more readable look.
+                // DEPARE gets just its range. Lights are grouped.
+
+                if( isLight ) {
+                    curLight->attributeNames.Add( curAttrName );
+                    if( curAttrName.StartsWith( _T("SECTR") ) ) curLight->hasSectors = true;
                 } else {
-                    if( inDepthRange ) {
-                        attribStr << _T("</font></td></tr>\n");
+                    if( curAttrName == _T("DRVAL1") ) {
+                        attribStr << _T("<tr><td><font size=-1>");
+                        inDepthRange = true;
+                    } else if( curAttrName == _T("DRVAL2") ) {
+                        attribStr << _T(" - ");
                         inDepthRange = false;
+                    } else {
+                        if( inDepthRange ) {
+                            attribStr << _T("</font></td></tr>\n");
+                            inDepthRange = false;
+                        }
+                        attribStr << _T("<tr><td valign=top><font size=-2>") << curAttrName;
+                        attribStr << _T("</font></td><td>&nbsp;&nbsp;</td><td valign=top><font size=-1>");
                     }
-                    attribStr << _T("<tr><td valign=top><font size=-2>") << curAttrName;
-                    attribStr << _T("</font></td><td>&nbsp;&nbsp;</td><td valign=top><font size=-1>");
                 }
+
+                // What we need to do...
+                // Change senc format, instead of (S), (I), etc, use the attribute types fetched from the S57attri...csv file
+                // This will be like (E), (L), (I), (F)
+                //  will affect lots of other stuff.  look for S57attVal.valType
+                // need to do this in creatsencrecord above, and update the senc format.
+
+                value = GetObjectAttributeValueAsString( current->obj, attrCounter, curAttrName );
+
+                if( isLight ) {
+                    curLight->attributeValues.Add( value );
+                } else {
+                    if( curAttrName == _T("INFORM") || curAttrName == _T("NINFOM") ) value.Replace(
+                            _T("|"), _T("<br>") );
+                    attribStr << value;
+
+                    if( !( curAttrName == _T("DRVAL1") ) ) {
+                        attribStr << _T("</font></td></tr>\n");
+                    }
+                }
+
+                attrCounter++;
+                curr_att += 6;
+
+            }             //while attrCounter < current->obj->n_attr
+
+            if( !isLight ) {
+                attribStr << _T("</table>\n");
+
+                objText += _T("<b>") + classDesc + _T("</b> <font size=-2>(") + className
+                        + _T(")</font>") + _T("<br>");
+
+                if( positionString.Length() ) objText << _T("<font size=-2>") << positionString
+                        << _T("</font><br>\n");
+
+                if( noAttr > 0 ) objText << attribStr;
+
+                if( node != rule_list->GetFirst() ) objText += _T("<hr noshade>");
+                objText += _T("<br>");
+                ret_val << objText;
             }
 
-            // What we need to do...
-            // Change senc format, instead of (S), (I), etc, use the attribute types fetched from the S57attri...csv file
-            // This will be like (E), (L), (I), (F)
-            //  will affect lots of other stuff.  look for S57attVal.valType
-            // need to do this in creatsencrecord above, and update the senc format.
-
-            value = GetObjectAttributeValueAsString( current->obj, attrCounter, curAttrName );
-
-            if( isLight ) {
-                curLight->attributeValues.Add( value );
-            } else {
-                if( curAttrName == _T("INFORM") || curAttrName == _T("NINFOM") ) value.Replace(
-                        _T("|"), _T("<br>") );
-                attribStr << value;
-
-                if( !( curAttrName == _T("DRVAL1") ) ) {
-                    attribStr << _T("</font></td></tr>\n");
-                }
-            }
-
-            attrCounter++;
-
-        }             //while *curr_att
-
-        if( !isLight ) {
-            attribStr << _T("</table>\n");
-
-            objText += _T("<b>") + classDesc + _T("</b> <font size=-2>(") + className
-                    + _T(")</font>") + _T("<br>");
-
-            if( positionString.Length() ) objText << _T("<font size=-2>") << positionString
-                    << _T("</font><br>\n");
-
-            if( noAttr > 0 ) objText << attribStr;
-
-            if( node != rule_list->GetFirst() ) objText += _T("<hr noshade>");
-            objText += _T("<br>");
-            ret_val << objText;
         }
-
-        free( curr_att0 );
-
     } // Object for loop
 
     if( lights.Count() > 0 ) {
@@ -6234,7 +7492,7 @@ wxString s57chart::CreateObjDescriptions( ListOfObjRazRules* rule_list )
                 lightsHtml << _T("<b>Light</b> <font size=-2>(LIGHTS)</font><br>");
                 lightsHtml << _T("<font size=-2>") << thisLight->position << _T("</font><br>\n");
 
-                if( curLight->hasSectors ) lightsHtml
+                if( curLight && curLight->hasSectors ) lightsHtml
                         <<_("<font size=-2>(Sector angles are True Bearings from Seaward)</font><br>");
 
                 lightsHtml << _T("<table>");
@@ -6246,11 +7504,11 @@ wxString s57chart::CreateObjDescriptions( ListOfObjRazRules* rule_list )
             attrIndex = thisLight->attributeNames.Index( _T("COLOUR") );
             if( attrIndex != wxNOT_FOUND ) {
                 wxString color = thisLight->attributeValues.Item( attrIndex );
-                if( color == _T("red(3)") ) lightsHtml
+                if( color == _T("red (3)") ) lightsHtml
                         << _T("<table border=0><tr><td bgcolor=red>&nbsp;&nbsp;&nbsp;</td></tr></table> ");
-                if( color == _T("green(4)") ) lightsHtml
+                if( color == _T("green (4)") ) lightsHtml
                         << _T("<table border=0><tr><td bgcolor=green>&nbsp;&nbsp;&nbsp;</td></tr></table> ");
-                if( color == _T("white(1)") ) lightsHtml
+                if( color == _T("white (1)") ) lightsHtml
                         << _T("<table border=0><tr><td bgcolor=yellow>&nbsp;&nbsp;&nbsp;</td></tr></table> ");
             }
 
@@ -6462,7 +7720,7 @@ void OpenCPN_OGRErrorHandler( CPLErr eErrClass, int nError, const char * pszErro
     else
         sprintf( buf, "   ERROR %d: %s\n", nError, pszErrorMsg );
 
-    if( g_bGDAL_Debug ) {
+    if( g_bGDAL_Debug  || ( CE_Debug != eErrClass) ) {          // log every warning or error
         wxString msg( buf, wxConvUTF8 );
         wxLogMessage( msg );
     }
@@ -6508,48 +7766,6 @@ const char *MyCSVGetField( const char * pszFilename, const char * pszKeyFieldNam
 }
 
 //------------------------------------------------------------------------
-//  s57RegistrarMgr Implementation
-//  This is a class holding the ctor and dtor for the global registrar
-//------------------------------------------------------------------------
-
-s57RegistrarMgr::s57RegistrarMgr( const wxString& csv_dir, FILE *flog )
-{
-    s57_initialize( csv_dir, flog );
-}
-
-s57RegistrarMgr::~s57RegistrarMgr()
-{
-    delete g_poRegistrar;
-    g_poRegistrar = NULL;
-}
-
-//------------------------------------------------------------------------
-//  Initialize GDAL/OGR S57ENC support
-//------------------------------------------------------------------------
-
-int s57_initialize( const wxString& csv_dir, FILE *flog )
-{
-
-    //      Get one instance of the s57classregistrar,
-    //      And be prepared to give it to any module that needs it
-
-    if( g_poRegistrar == NULL ) {
-        g_poRegistrar = new S57ClassRegistrar();
-
-        if( !g_poRegistrar->LoadInfo( csv_dir.mb_str(), FALSE ) ) {
-            wxString msg( _T("   Error: Could not load S57 ClassInfo from ") );
-            msg.Append( csv_dir );
-            wxLogMessage( msg );
-
-            delete g_poRegistrar;
-            g_poRegistrar = NULL;
-        }
-    }
-
-    return 0;
-}
-
-//------------------------------------------------------------------------
 //
 //          Some s57 Utilities
 //          Meant to be called "bare", usually with no class instance.
@@ -6585,11 +7801,14 @@ bool s57_GetChartExtent( const wxString& FullPath, Extent *pext )
 }
 
 void s57_DrawExtendedLightSectors( ocpnDC& dc, ViewPort& viewport, std::vector<s57Sector_t>& sectorlegs ) {
-    double rangeScale = 0.0;
+    float rangeScale = 0.0;
 
     if( sectorlegs.size() > 0 ) {
         std::vector<int> sectorangles;
         for( unsigned int i=0; i<sectorlegs.size(); i++ ) {
+            if( fabs( sectorlegs[i].sector1 - sectorlegs[i].sector2 ) < 0.3 )
+                continue;
+
             double endx, endy;
             ll_gc_ll( sectorlegs[i].pos.m_y, sectorlegs[i].pos.m_x,
                     sectorlegs[i].sector1 + 180.0, sectorlegs[i].range,
@@ -6606,7 +7825,8 @@ void s57_DrawExtendedLightSectors( ocpnDC& dc, ViewPort& viewport, std::vector<s
             wxPoint lightPos = viewport.GetPixFromLL( sectorlegs[i].pos.m_y, sectorlegs[i].pos.m_x );
 
             // Make sure arcs are well inside viewport.
-            double rangePx = sqrt( pow(lightPos.x - end1.x, 2.0) + pow(lightPos.y - end1.y, 2.0) );
+            float rangePx = sqrtf( powf( (float) (lightPos.x - end1.x), 2) +
+                                   powf( (float) (lightPos.y - end1.y), 2) );
             rangePx /= 3.0;
             if( rangeScale == 0.0 ) {
                 rangeScale = 1.0;
@@ -6618,11 +7838,11 @@ void s57_DrawExtendedLightSectors( ocpnDC& dc, ViewPort& viewport, std::vector<s
             rangePx = rangePx * rangeScale;
 
             int legOpacity;
-            wxPen *arcpen = wxThePenList->FindOrCreatePen( sectorlegs[i].color, 12, wxSOLID );
+            wxPen *arcpen = wxThePenList->FindOrCreatePen( sectorlegs[i].color, 12, wxPENSTYLE_SOLID );
             arcpen->SetCap( wxCAP_BUTT );
             dc.SetPen( *arcpen );
 
-            double angle1, angle2;
+            float angle1, angle2;
             angle1 = -(sectorlegs[i].sector2 + 90.0) - viewport.rotation * 180.0 / PI;
             angle2 = -(sectorlegs[i].sector1 + 90.0) - viewport.rotation * 180.0 / PI;
             if( angle1 > angle2 ) {
@@ -6630,25 +7850,23 @@ void s57_DrawExtendedLightSectors( ocpnDC& dc, ViewPort& viewport, std::vector<s
             }
             int lpx = lightPos.x;
             int lpy = lightPos.y;
-            int npoints = 1;
+            int npoints = 0;
             wxPoint arcpoints[150]; // Size relates to "step" below.
 
-            arcpoints[0].x = lpx + (int) ( rangePx * cos( angle1 * PI / 180. ) );
-            arcpoints[0].y = lpy - (int) ( rangePx * sin( angle1 * PI / 180. ) );
-            double step = 3.0;
+            float step = 3.0;
             while( (step < 15) && ((rangePx * sin(step * PI / 180.)) < 10) ) step += 2.0; // less points on small arcs
 
             // Make sure we start and stop exactly on the leg lines.
             int narc = ( angle2 - angle1 ) / step;
             narc++;
-            step = ( angle2 - angle1 ) / (double)narc;
+            step = ( angle2 - angle1 ) / (float)narc;
 
-            if( angle2 - angle1 < 15 && sectorlegs[i].fillSector ) {
+            if( sectorlegs[i].isleading && (angle2 - angle1 < 60)  ) {
                 wxPoint yellowCone[3];
                 yellowCone[0] = lightPos;
                 yellowCone[1] = end1;
                 yellowCone[2] = end2;
-                arcpen = wxThePenList->FindOrCreatePen( wxColor( 0,0,0,0 ), 1, wxSOLID );
+                arcpen = wxThePenList->FindOrCreatePen( wxColor( 0,0,0,0 ), 1, wxPENSTYLE_SOLID );
                 dc.SetPen( *arcpen );
                 wxColor c = sectorlegs[i].color;
                 c.Set( c.Red(), c.Green(), c.Blue(), 0.6*c.Alpha() );
@@ -6656,7 +7874,7 @@ void s57_DrawExtendedLightSectors( ocpnDC& dc, ViewPort& viewport, std::vector<s
                 dc.StrokePolygon( 3, yellowCone, 0, 0 );
                 legOpacity = 50;
             } else {
-                for( double a = angle1; a <= angle2 + 0.1; a += step ) {
+                for( float a = angle1; a <= angle2 + 0.1; a += step ) {
                     int x = lpx + (int) ( rangePx * cos( a * PI / 180. ) );
                     int y = lpy - (int) ( rangePx * sin( a * PI / 180. ) );
                     arcpoints[npoints].x = x;
@@ -6667,26 +7885,35 @@ void s57_DrawExtendedLightSectors( ocpnDC& dc, ViewPort& viewport, std::vector<s
                 legOpacity = 128;
             }
 
-            arcpen = wxThePenList->FindOrCreatePen( wxColor( 0,0,0,legOpacity ), 1, wxSOLID );
+            arcpen = wxThePenList->FindOrCreatePen( wxColor( 0,0,0,legOpacity ), 1, wxPENSTYLE_SOLID );
             dc.SetPen( *arcpen );
 
             // Only draw each leg line once.
 
             bool haveAngle1 = false;
             bool haveAngle2 = false;
+            int sec1 = (int)sectorlegs[i].sector1;
+            int sec2 = (int)sectorlegs[i].sector2;
+            if(sec1 > 360) sec1 -= 360;
+            if(sec2 > 360) sec2 -= 360;
+
+            if((sec2 == 360) && (sec1 == 0))  //FS#1437
+                continue;
+
             for( unsigned int j=0; j<sectorangles.size(); j++ ) {
-                if( sectorangles[j] == (int)sectorlegs[i].sector1 ) haveAngle1 = true;
-                if( sectorangles[j] == (int)sectorlegs[i].sector2 ) haveAngle2 = true;
+
+                if( sectorangles[j] == sec1 ) haveAngle1 = true;
+                if( sectorangles[j] == sec2 ) haveAngle2 = true;
             }
 
             if( ! haveAngle1 ) {
                 dc.StrokeLine( lightPos, end1 );
-                sectorangles.push_back( (int) sectorlegs[i].sector1 );
+                sectorangles.push_back( sec1 );
             }
 
             if( ! haveAngle2 ) {
                 dc.StrokeLine( lightPos, end2 );
-                sectorangles.push_back( (int) sectorlegs[i].sector2 );
+                sectorangles.push_back( sec2 );
             }
         }
     }
@@ -6694,9 +7921,22 @@ void s57_DrawExtendedLightSectors( ocpnDC& dc, ViewPort& viewport, std::vector<s
 
 bool s57_CheckExtendedLightSectors( int mx, int my, ViewPort& viewport, std::vector<s57Sector_t>& sectorlegs ) {
     double cursor_lat, cursor_lon;
-    static double lastLat, lastLon;
+    static float lastLat, lastLon;
 
-    if( !ps52plib || !ps52plib->m_bExtendLightSectors ) return false;
+    if( !ps52plib || !ps52plib->m_bExtendLightSectors )
+        return false;
+
+    ChartPlugInWrapper *target_plugin_chart = NULL;
+    s57chart *Chs57 = NULL;
+
+    ChartBase *target_chart = cc1->GetChartAtCursor();
+    if( target_chart ){
+        if( (target_chart->GetChartType() == CHART_TYPE_PLUGIN) && (target_chart->GetChartFamily() == CHART_FAMILY_VECTOR) )
+            target_plugin_chart = dynamic_cast<ChartPlugInWrapper *>(target_chart);
+        else
+            Chs57 = dynamic_cast<s57chart*>( target_chart );
+    }
+
 
     cc1->GetCanvasPixPoint ( mx, my, cursor_lat, cursor_lon );
 
@@ -6706,23 +7946,78 @@ bool s57_CheckExtendedLightSectors( int mx, int my, ViewPort& viewport, std::vec
     lastLon = cursor_lon;
     bool newSectorsNeedDrawing = false;
 
-    ChartBase *targetchart = cc1->GetChartAtCursor();
-    s57chart *chart = dynamic_cast<s57chart*>( targetchart );
+    bool bhas_red_green = false;
+    bool bleading_attribute = false;
 
-    if( chart ) {
-        sectorlegs.clear();
+    int opacity = 100;
+    if( cc1->GetColorScheme() == GLOBAL_COLOR_SCHEME_DUSK ) opacity = 50;
+    if( cc1->GetColorScheme() == GLOBAL_COLOR_SCHEME_NIGHT) opacity = 20;
 
+    int yOpacity = (float)opacity*1.3; // Matched perception of white/yellow with red/green
+
+    if( target_plugin_chart || Chs57  ) {
+        // Go get the array of all objects at the cursor lat/lon
         float selectRadius = 16 / ( viewport.view_scale_ppm * 1852 * 60 );
 
-        ListOfObjRazRules* rule_list =
-                chart->GetObjRuleListAtLatLon( cursor_lat, cursor_lon, selectRadius, &viewport );
+        ListOfObjRazRules* rule_list = NULL;
+        ListOfPI_S57Obj* pi_rule_list = NULL;
+        if( Chs57 )
+            rule_list = Chs57->GetObjRuleListAtLatLon( cursor_lat, cursor_lon, selectRadius, &viewport, MASK_POINT );
+        else if( target_plugin_chart )
+            pi_rule_list = g_pi_manager->GetPlugInObjRuleListAtLatLon( target_plugin_chart,
+                                                                       cursor_lat, cursor_lon, selectRadius, viewport );
+
+
+        sectorlegs.clear();
 
         wxPoint2DDouble lightPosD(0,0);
+        wxPoint2DDouble objPos;
 
-        for( ListOfObjRazRules::Node *node = rule_list->GetLast(); node; node = node->GetPrevious() ) {
-            ObjRazRules *current = node->GetData();
-            S57Obj* light = current->obj;
-            char* curr_att;
+        char *curr_att = NULL;
+        int n_attr = 0;
+        wxArrayOfS57attVal *attValArray = NULL;
+
+        ListOfObjRazRules::Node *snode = NULL;
+        ListOfPI_S57Obj::Node *pnode = NULL;
+
+        if(Chs57)
+            snode = rule_list->GetLast();
+        else if( target_plugin_chart )
+            pnode = pi_rule_list->GetLast();
+
+
+        while(1) {
+
+            bool is_light = false;
+            if(Chs57) {
+                if(!snode)
+                    break;
+
+                ObjRazRules *current = snode->GetData();
+                S57Obj* light = current->obj;
+                if( !strcmp( light->FeatureName, "LIGHTS" ) ) {
+                    objPos = wxPoint2DDouble( light->m_lat, light->m_lon );
+                    curr_att = light->att_array;
+                    n_attr = light->n_attr;
+                    attValArray = light->attVal;
+                    is_light = true;
+                }
+            }
+            else if( target_plugin_chart ) {
+                if(!pnode)
+                    break;
+                PI_S57Obj* light = pnode->GetData();
+                if( !strcmp( light->FeatureName, "LIGHTS" ) ) {
+                    objPos = wxPoint2DDouble( light->m_lat, light->m_lon );
+                    curr_att = light->att_array;
+                    n_attr = light->n_attr;
+                    attValArray = light->attVal;
+                    is_light = true;
+                }
+            }
+
+
+            //  Ready to go
             int attrCounter;
             double sectr1 = -1;
             double sectr2 = -1;
@@ -6730,74 +8025,110 @@ bool s57_CheckExtendedLightSectors( int mx, int my, ViewPort& viewport, std::vec
             wxString curAttrName;
             wxColor color;
 
-            if( !strcmp( light->FeatureName, "LIGHTS" ) ) {
-                wxPoint2DDouble objPos( light->m_lat, light->m_lon );
-                if( lightPosD.m_x == 0 && lightPosD.m_y == 0.0 ) lightPosD = objPos;
-                if( lightPosD == objPos ) {
-                    char *curr_att0 = (char *) calloc( light->attList->Len() + 1, 1 );
-                    strncpy( curr_att0, light->attList->mb_str(), light->attList->Len() );
-                    curr_att = curr_att0;
+            if( lightPosD.m_x == 0 && lightPosD.m_y == 0.0 )
+                lightPosD = objPos;
+
+            if( is_light && (lightPosD == objPos) ) {
+
+                if( curr_att ) {
+                    bool bviz = true;
 
                     attrCounter = 0;
                     int noAttr = 0;
                     bool inDepthRange = false;
                     s57Sector_t sector;
 
-                    while( *curr_att ) {
-                        curAttrName.Clear();
+                    bleading_attribute = false;
+
+                    while( attrCounter < n_attr ) {
+                        curAttrName = wxString(curr_att, wxConvUTF8, 6 );
                         noAttr++;
-                        while( ( *curr_att ) && ( *curr_att != '\037' ) ) {
-                            char t = *curr_att++;
-                            curAttrName.Append( t );
+
+                        S57attVal *pAttrVal = NULL;
+                        if( attValArray ){
+                            if(Chs57)
+                                pAttrVal = attValArray->Item(attrCounter);
+                            else if( target_plugin_chart )
+                                pAttrVal = attValArray->Item(attrCounter);
                         }
 
-                        if( *curr_att == '\037' ) curr_att++;
+                        wxString value = s57chart::GetAttributeValueAsString( pAttrVal, curAttrName );
 
-                        wxString value = chart->GetObjectAttributeValueAsString( light, attrCounter, curAttrName );
-                        int opacity = 100;
-                        if( cc1->GetColorScheme() == GLOBAL_COLOR_SCHEME_DUSK ) opacity = 50;
-                        if( cc1->GetColorScheme() == GLOBAL_COLOR_SCHEME_NIGHT) opacity = 20;
-
-                        int yOpacity = (float)opacity*1.3; // Matched perception with red/green
-
-                        if( curAttrName == _T("SECTR1") ) value.ToDouble( &sectr1 );
+                        if( curAttrName == _T("LITVIS") ){
+                            if(value.StartsWith(_T("obsc")) )
+                                bviz = false;
+                        }
+                        if( curAttrName == _T("SECTR1") )value.ToDouble( &sectr1 );
                         if( curAttrName == _T("SECTR2") ) value.ToDouble( &sectr2 );
                         if( curAttrName == _T("VALNMR") ) value.ToDouble( &valnmr );
                         if( curAttrName == _T("COLOUR") ) {
-                            sector.fillSector = true;
-                            color = wxColor( 255, 255, 0, yOpacity );
                             if( value == _T("red(3)") ) {
                                 color = wxColor( 255, 0, 0, opacity );
-                                sector.fillSector = false;
+                                sector.iswhite = false;
+                                bhas_red_green = true;
                             }
+
                             if( value == _T("green(4)") ) {
                                 color = wxColor( 0, 255, 0, opacity );
-                                sector.fillSector = false;
+                                sector.iswhite = false;
+                                bhas_red_green = true;
                             }
                         }
+
                         if( curAttrName == _T("EXCLIT") ) {
                             if( value.Find( _T("(3)") ) ) valnmr = 1.0;  // Fog lights.
                         }
+
+                        if( curAttrName == _T("CATLIT") ){
+                            if( value.Upper().StartsWith( _T("DIRECT")) || value.Upper().StartsWith(_T("LEAD")) )
+                                bleading_attribute = true;
+                        }
+
                         attrCounter++;
+                        curr_att += 6;
                     }
 
-                    free(curr_att0);
-
                     if( ( sectr1 >= 0 ) && ( sectr2 >= 0 ) ) {
-                        sector.pos.m_x = light->m_lon;
-                        sector.pos.m_y = light->m_lat;
+                            if( sectr1 > sectr2 ) {             // normalize
+                                    sectr2 += 360.0;
+                            }
+
+                        sector.pos.m_x = objPos.m_y;              // lon
+                        sector.pos.m_y = objPos.m_x;
 
                         sector.range = (valnmr > 0.0) ? valnmr : 2.5; // Short default range.
                         sector.sector1 = sectr1;
                         sector.sector2 = sectr2;
+
+                        if(!color.IsOk()){
+                            color = wxColor( 255, 255, 0, yOpacity );
+                            sector.iswhite = true;
+                        }
                         sector.color = color;
+                        sector.isleading = false;           // tentative judgment, check below
+
+                        if( bleading_attribute )
+                            sector.isleading = true;
 
                         bool newsector = true;
                         for( unsigned int i=0; i<sectorlegs.size(); i++ ) {
                             if( sectorlegs[i].pos == sector.pos &&
                                 sectorlegs[i].sector1 == sector.sector1 &&
-                                sectorlegs[i].sector2 == sector.sector2 ) newsector = false;
+                                sectorlegs[i].sector2 == sector.sector2 ) {
+                                newsector = false;
+                        //  In the case of duplicate sectors, choose the instance with largest range.
+                            //  This applies to the case where day and night VALNMR are different, and so
+                            //  makes the vector result independent of the order of day/night light features.
+                                sectorlegs[i].range = wxMax(sectorlegs[i].range, sector.range);
+                            }
                         }
+
+                        if(!bviz)
+                            newsector = false;
+
+                        if((sector.sector2 == 360) && ( sector.sector1 == 0))  //FS#1437
+                            newsector = false;
+
                         if( newsector ) {
                             sectorlegs.push_back( sector );
                             newSectorsNeedDrawing = true;
@@ -6805,10 +8136,73 @@ bool s57_CheckExtendedLightSectors( int mx, int my, ViewPort& viewport, std::vec
                     }
                 }
             }
+
+
+
+
+            if(Chs57)
+                snode = snode->GetPrevious();
+            else if( target_plugin_chart )
+                pnode = pnode->GetPrevious();
+
+        }               // end of while
+
+        if(rule_list) {
+            rule_list->Clear();
+            delete rule_list;
         }
 
-        rule_list->Clear();
-        delete rule_list;
+        if(pi_rule_list) {
+            pi_rule_list->Clear();
+            delete pi_rule_list;
+        }
     }
+
+#if 0
+    //  Work with the sector legs vector to identify  and mark "Leading Lights"
+    int ns = sectorlegs.size();
+    if( sectorlegs.size() > 0 ) {
+        for( unsigned int i=0; i<sectorlegs.size(); i++ ) {
+            if( fabs( sectorlegs[i].sector1 - sectorlegs[i].sector2 ) < 0.5 )
+                continue;
+
+            if(((sectorlegs[i].sector2 - sectorlegs[i].sector1) < 15)  && sectorlegs[i].iswhite ) {
+                //      Check to see if this sector has a visible range greater than any other white light
+
+                if( sectorlegs.size() > 1 ) {
+                    bool bleading = true;
+                    for( unsigned int j=0; j<sectorlegs.size(); j++ ) {
+                        if(i == j)
+                            continue;
+                        if((sectorlegs[j].iswhite) && (sectorlegs[i].range <= sectorlegs[j].range) ){
+                            if((sectorlegs[j].sector2 - sectorlegs[j].sector1) >= 15){  // test sector should not be a leading light
+                                bleading = false;    // cannot be a sector, since its range is <= another white light
+                                break;
+                            }
+                        }
+                    }
+
+                    if(bleading)
+                        sectorlegs[i].isleading = true;
+                }
+            }
+            else
+                sectorlegs[i].isleading = false;
+
+        }
+    }
+#endif
+
+//  Work with the sector legs vector to identify  and mark "Leading Lights"
+//  Sectors with CATLIT "Leading" or "Directional" attribute set have already been marked
+    for( unsigned int i=0; i<sectorlegs.size(); i++ ) {
+
+        if(((sectorlegs[i].sector2 - sectorlegs[i].sector1) < 15) ) {
+            if( sectorlegs[i].iswhite && bhas_red_green )
+                sectorlegs[i].isleading = true;
+        }
+    }
+
+
     return newSectorsNeedDrawing;
 }

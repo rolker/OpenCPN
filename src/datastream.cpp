@@ -1,4 +1,4 @@
-/******************************************************************************
+/***************************************************************************
  *
  * Project:  OpenCPN
  * Purpose:  NMEA Data Stream Object
@@ -42,50 +42,69 @@
 #include <math.h>
 #include <time.h>
 
+#ifndef __WXMSW__
+#include <arpa/inet.h>
+#include <netinet/tcp.h>
+#endif
+
 #include "dychart.h"
 
 #include "datastream.h"
+#include "OCPN_DataStreamEvent.h"
+#include "OCP_DataStreamInput_Thread.h"
 #include "garmin/jeeps/garmin_wrapper.h"
 
+#ifdef __OCPN__ANDROID__
+#include "androidUTIL.h"
+#endif
+
 #include <vector>
-
-
-extern int              g_nNMEADebug;
-extern bool             g_bGPSAISMux;
-extern int              g_total_NMEAerror_messages;
-
-
-
 
 #if !defined(NAN)
 static const long long lNaN = 0xfff8000000000000;
 #define NAN (*(double*)&lNaN)
 #endif
 
-//------------------------------------------------------------------------------
-//    OCPN_DataStreamEvent Event Implementation
-//------------------------------------------------------------------------------
-
 const wxEventType wxEVT_OCPN_DATASTREAM = wxNewEventType();
 
-OCPN_DataStreamEvent::OCPN_DataStreamEvent( wxEventType commandType, int id )
-      :wxEvent(id, commandType)
+#define N_DOG_TIMEOUT   5
+
+#ifdef __WXMSW__
+// {2C9C45C2-8E7D-4C08-A12D-816BBAE722C0}
+DEFINE_GUID(GARMIN_GUID1, 0x2c9c45c2L, 0x8e7d, 0x4c08, 0xa1, 0x2d, 0x81, 0x6b, 0xba, 0xe7, 0x22, 0xc0);
+#endif
+
+#ifdef __OCPN__ANDROID__
+#include <netdb.h>
+int gethostbyaddr_r(const char *, int, int, struct hostent *, char *, size_t, struct hostent **, int *)
 {
+    wxLogMessage(_T("Called stub gethostbyaddr_r()"));
+    return 0;
+}
+#endif
+
+
+bool CheckSumCheck(const std::string& sentence)
+{
+    size_t check_start = sentence.find('*');
+    if(check_start == wxString::npos || check_start > sentence.size() - 3)
+        return false; // * not found, or it didn't have 2 characters following it.
+        
+    std::string check_str = sentence.substr(check_start+1,2);
+    unsigned long checksum;
+    //    if(!check_str.ToULong(&checksum,16))
+    if(!(checksum = strtol(check_str.c_str(), 0, 16)))
+        return false;
+    
+    unsigned char calculated_checksum = 0;
+    for(std::string::const_iterator i = sentence.begin()+1; i != sentence.end() && *i != '*'; ++i)
+        calculated_checksum ^= static_cast<unsigned char> (*i);
+    
+    return calculated_checksum == checksum;
+    
 }
 
 
-OCPN_DataStreamEvent::~OCPN_DataStreamEvent( )
-{
-}
-
-wxEvent* OCPN_DataStreamEvent::Clone() const
-{
-    OCPN_DataStreamEvent *newevent=new OCPN_DataStreamEvent(*this);
-    newevent->m_NMEAstring=this->m_NMEAstring;
-    newevent->m_StreamName=this->m_StreamName;
-    newevent->m_priority=this->m_priority;
-    return newevent;
-}
 
 
 //------------------------------------------------------------------------------
@@ -95,12 +114,14 @@ wxEvent* OCPN_DataStreamEvent::Clone() const
 BEGIN_EVENT_TABLE(DataStream, wxEvtHandler)
 
     EVT_SOCKET(DS_SOCKET_ID, DataStream::OnSocketEvent)
-//  EVT_TIMER(TIMER_NMEA1, DataStream::OnTimerNMEA)
-
-  END_EVENT_TABLE()
+    EVT_SOCKET(DS_SERVERSOCKET_ID, DataStream::OnServerSocketEvent)
+    EVT_TIMER(TIMER_SOCKET, DataStream::OnTimerSocket)
+    EVT_TIMER(TIMER_SOCKET + 1, DataStream::OnSocketReadWatchdogTimer)
+END_EVENT_TABLE()
 
 // constructor
 DataStream::DataStream(wxEvtHandler *input_consumer,
+             const ConnectionType conn_type,         
              const wxString& Port,
              const wxString& BaudRate,
              dsPortType io_select,
@@ -109,8 +130,6 @@ DataStream::DataStream(wxEvtHandler *input_consumer,
              int EOS_type,
              int handshake_type,
              void *user_data )
-:m_net_protocol(GPSD),m_connection_type(SERIAL)
-
 {
     m_consumer = input_consumer;
     m_portstring = Port;
@@ -120,6 +139,7 @@ DataStream::DataStream(wxEvtHandler *input_consumer,
     m_handshake = handshake_type;
     m_user_data = user_data;
     m_bGarmin_GRMN_mode = bGarmin;
+    m_connection_type = conn_type;
 
     Init();
 
@@ -135,6 +155,13 @@ void DataStream::Init(void)
     m_Thread_run_flag = -1;
     m_sock = 0;
     m_tsock = 0;
+    m_is_multicast = false;
+    m_socket_server = 0;
+    m_txenter = 0;
+    m_net_protocol = GPSD;
+    
+    m_socket_timer.SetOwner(this, TIMER_SOCKET);
+    m_socketread_watchdog_timer.SetOwner(this, TIMER_SOCKET + 1);
     
 }
 
@@ -143,149 +170,236 @@ void DataStream::Open(void)
     //  Open a port
     wxLogMessage( wxString::Format(_T("Opening NMEA Datastream %s"), m_portstring.c_str()) );
     
-    if( (m_io_select == DS_TYPE_INPUT) || (m_io_select == DS_TYPE_INPUT_OUTPUT) ) {
+    //    Data Source is specified serial port
+    if(m_portstring.Contains(_T("Serial"))) {
+        m_connection_type = SERIAL;
+        wxString comx;
+        comx =  m_portstring.AfterFirst(':');      // strip "Serial:"
 
-        //    Data Source is specified serial port
-        if(m_portstring.Contains(_T("Serial"))) {
+        wxString port_uc = m_portstring.Upper();
+
+        if( (wxNOT_FOUND != port_uc.Find(_T("USB"))) && (wxNOT_FOUND != port_uc.Find(_T("GARMIN"))) ) {
+            m_GarminHandler = new GarminProtocolHandler(this, m_consumer,  true);
+        }    
+        else if( m_bGarmin_GRMN_mode ) {
+            m_GarminHandler = new GarminProtocolHandler(this, m_consumer,  false);
+        }
+        else {
             m_connection_type = SERIAL;
             wxString comx;
             comx =  m_portstring.AfterFirst(':');      // strip "Serial:"
 
-            wxString port_uc = m_portstring.Upper();
-
-            if( (wxNOT_FOUND != port_uc.Find(_T("USB"))) && (wxNOT_FOUND != port_uc.Find(_T("GARMIN"))) ) {
-                m_GarminHandler = new GarminProtocolHandler(this, m_consumer,  true);
-            }    
-            else if( m_bGarmin_GRMN_mode ) {
-                m_GarminHandler = new GarminProtocolHandler(this, m_consumer,  false);
-            }
-            else {
-                m_connection_type = SERIAL;
-                wxString comx;
-                comx =  m_portstring.AfterFirst(':');      // strip "Serial:"
-
+            comx = comx.BeforeFirst(' ');               // strip off any description provided by Windows
+            
+#if 0
  #ifdef __WXMSW__
-                wxString scomx = comx;
-                scomx.Prepend(_T("\\\\.\\"));                  // Required for access to Serial Ports greater than COM9
+            wxString scomx = comx;
+            scomx.Prepend(_T("\\\\.\\"));                  // Required for access to Serial Ports greater than COM9
 
-        //  As a quick check, verify that the specified port is available
-                HANDLE hSerialComm = CreateFile(scomx.fn_str(),       // Port Name
-                                          GENERIC_READ,
-                                          0,
-                                          NULL,
-                                          OPEN_EXISTING,
-                                          0,
-                                          NULL);
+    //  As a quick check, verify that the specified port is available
+            HANDLE hSerialComm = CreateFile(scomx.fn_str(),       // Port Name
+                                      GENERIC_READ,
+                                      0,
+                                      NULL,
+                                      OPEN_EXISTING,
+                                      0,
+                                      NULL);
 
-                if(hSerialComm == INVALID_HANDLE_VALUE) {
-                    m_last_error = DS_ERROR_PORTNOTFOUND;
-                    return;
-                }
-                else
-                    CloseHandle(hSerialComm);
-#endif
-        //    Kick off the DataSource RX thread
-                m_pSecondary_Thread = new OCP_DataStreamInput_Thread(this,
-                                                                     m_consumer,
-                                                                     comx, m_BaudRate,
-                                                                     &m_output_mutex, m_io_select);
-                m_Thread_run_flag = 1;
-                m_pSecondary_Thread->Run();
-
-                m_bok = true;
+            if(hSerialComm == INVALID_HANDLE_VALUE) {
+                m_last_error = DS_ERROR_PORTNOTFOUND;
+                wxLogMessage( _T("   Error, comm port open failure, INVALID_HANDLE_VALUE, Datastream skipped.") );
+                return;
             }
+            else
+                CloseHandle(hSerialComm);
+#endif
+#endif
+
+    //    Kick off the DataSource RX thread
+            m_pSecondary_Thread = new OCP_DataStreamInput_Thread(this,
+                                                                 m_consumer,
+                                                                 comx, m_BaudRate,
+                                                                 m_io_select);
+            m_Thread_run_flag = 1;
+            m_pSecondary_Thread->Run();
+
+            m_bok = true;
         }
-        else if(m_portstring.Contains(_T("GPSD"))){
+    }
+    
+    else if(m_connection_type == NETWORK){
+        if(m_portstring.Contains(_T("GPSD"))){
             m_net_addr = _T("127.0.0.1");              // defaults
             m_net_port = _T("2947");
             m_net_protocol = GPSD;
-            m_connection_type = NETWORK;
         }
         else if(m_portstring.StartsWith(_T("TCP"))) {
-            m_net_addr = _T("127.0.0.1");              // defaults
-            m_net_port = _T("2947");
+            m_net_addr = _T("0.0.0.0");              // defaults
+            m_net_port = _T("10110");
             m_net_protocol = TCP;
-            m_connection_type = NETWORK;
         }
         else if(m_portstring.StartsWith(_T("UDP"))) {
             m_net_addr =  _T("0.0.0.0");              // any address
-            m_net_port = _T("0");                     // any port
+            m_net_port = _T("10110");
             m_net_protocol = UDP;
-            m_connection_type = NETWORK;
+        }
+        else {
+            m_net_addr =  _T("0.0.0.0");              // any address
+            m_net_port = _T("0");
+            m_net_protocol = UDP;
         }
         
-        if(m_connection_type == NETWORK){
+        //  Capture the  parameters from the portstring
+
+        wxStringTokenizer tkz(m_portstring, _T(":"));
+        wxString token = tkz.GetNextToken();                //GPSD, TCP or UDP
+
+        token = tkz.GetNextToken();                         //ip
+        if(!token.IsEmpty())
+            m_net_addr = token;
+
+        token = tkz.GetNextToken();                         //port
+        if(!token.IsEmpty())
+            m_net_port = token;
+
         
-            //  Capture the  parameters from the portstring
+        m_addr.Hostname(m_net_addr);
+        m_addr.Service(m_net_port);
+        
+#ifdef __UNIX__
+# if wxCHECK_VERSION(3,0,0)
+        in_addr_t addr = ((struct sockaddr_in *) m_addr.GetAddressData())->sin_addr.s_addr;
+# else
+        in_addr_t addr = ((struct sockaddr_in *) m_addr.GetAddress()->m_addr)->sin_addr.s_addr;
+# endif
+#else
+        unsigned int addr = inet_addr(m_addr.IPAddress().mb_str());
+#endif
+        // Create the socket
+        switch(m_net_protocol){
+            case GPSD: {
+                m_sock = new wxSocketClient();
+                m_sock->SetEventHandler(*this, DS_SOCKET_ID);
+                m_sock->SetNotify(wxSOCKET_CONNECTION_FLAG | wxSOCKET_INPUT_FLAG | wxSOCKET_LOST_FLAG);
+                m_sock->Notify(TRUE);
+                m_sock->SetTimeout(1);              // Short timeout
 
-            wxStringTokenizer tkz(m_portstring, _T(":"));
-            wxString token = tkz.GetNextToken();                //GPSD, TCP or UDP
-
-            token = tkz.GetNextToken();                         //ip
-            if(!token.IsEmpty())
-                m_net_addr = token;
-
-            token = tkz.GetNextToken();                         //port
-            if(!token.IsEmpty())
-                m_net_port = token;
-
+                wxSocketClient* tcp_socket = dynamic_cast<wxSocketClient*>(m_sock);
+                tcp_socket->Connect(m_addr, FALSE);
+                m_brx_connect_event = false;
             
-            m_addr.Hostname(m_net_addr);
-            m_addr.Service(m_net_port);
-            
-            // Create the socket
-            switch(m_net_protocol){
-                case GPSD:
-                case TCP:
+                break;
+            }
+            case TCP: {
+                int isServer = ((addr == INADDR_ANY)?1:0);
+
+                wxSocketBase* tsock;
+
+                if (isServer) {
+                    m_socket_server = new wxSocketServer(m_addr, wxSOCKET_REUSEADDR );
+                    tsock = m_socket_server;
+                } else {
                     m_sock = new wxSocketClient();
-                    break;
-                case UDP:
+                    tsock = m_sock;
+                }
+
+                // if((m_io_select != DS_TYPE_INPUT) && (isServer?m_socket_server->IsOk():m_sock->IsOk())) {
+                if (isServer) {
+                    m_socket_server->SetEventHandler(*this, DS_SERVERSOCKET_ID);
+                    m_socket_server->SetNotify( wxSOCKET_CONNECTION_FLAG );
+                    m_socket_server->Notify(TRUE);
+                    m_socket_server->SetTimeout(1);    // Short timeout
+                }
+                else {
+                    m_sock->SetEventHandler(*this, DS_SOCKET_ID);
+                    int notify_flags=(wxSOCKET_CONNECTION_FLAG | wxSOCKET_LOST_FLAG );
+                    if (m_io_select != DS_TYPE_INPUT)
+                        notify_flags |= wxSOCKET_OUTPUT_FLAG;
+                    if (m_io_select != DS_TYPE_OUTPUT)
+                        notify_flags |= wxSOCKET_INPUT_FLAG;
+                    m_sock->SetNotify(notify_flags);
+                    m_sock->Notify(TRUE);
+                    m_sock->SetTimeout(1);              // Short timeout
+
+                    m_brx_connect_event = false;
+                    m_socket_timer.Start(100, wxTIMER_ONE_SHOT);    // schedule a connection
+                }
+                
+                break;
+            }
+            case UDP:
+                if(m_io_select != DS_TYPE_OUTPUT) {
                     //  We need a local (bindable) address to create the Datagram receive socket
                     // Set up the receive socket
                     wxIPV4address conn_addr;
                     conn_addr.Service(m_net_port);
                     conn_addr.AnyAddress();    
                     m_sock = new wxDatagramSocket(conn_addr, wxSOCKET_NOWAIT | wxSOCKET_REUSEADDR);
-                    
-                    // Set up another socket for transmit
-                    if((m_io_select == DS_TYPE_INPUT_OUTPUT) || (m_io_select == DS_TYPE_OUTPUT)) {
-                        wxIPV4address tconn_addr;
-                        tconn_addr.Service(0);          // use ephemeral out port
-                        tconn_addr.AnyAddress();    
-                        m_tsock = new wxDatagramSocket(tconn_addr, wxSOCKET_NOWAIT | wxSOCKET_REUSEADDR);
-                        wxString addr = m_addr.IPAddress();
-                        if( addr.EndsWith(_T("255")) ) {
-                            int broadcastEnable=1;
-                            bool bam = m_tsock->SetOption(SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
-                        }
+
+                    // Test if address is IPv4 multicast
+                    if ((ntohl(addr) & 0xf0000000)  == 0xe0000000) {
+                        m_is_multicast=true;
+                        m_mrq.imr_multiaddr.s_addr = addr;
+                        m_mrq.imr_interface.s_addr = INADDR_ANY;
+
+                        m_sock->SetOption(IPPROTO_IP,IP_ADD_MEMBERSHIP,&m_mrq, sizeof(m_mrq));
                     }
-                    break;
-            }
-
-            // Setup the event handler and subscribe to most events
-            m_sock->SetEventHandler(*this, DS_SOCKET_ID);
-
-            m_sock->SetNotify(wxSOCKET_CONNECTION_FLAG |
-                wxSOCKET_INPUT_FLAG |
-                wxSOCKET_LOST_FLAG);
-            m_sock->Notify(TRUE);
-            m_sock->SetTimeout(1);              // Short timeout
-
-            switch(m_net_protocol){
-                case GPSD:
-                case TCP:{
-                    wxSocketClient* tcp_socket = dynamic_cast<wxSocketClient*>(m_sock);
-                    tcp_socket->Connect(m_addr, FALSE);
-                    break;
+                
+                    m_sock->SetEventHandler(*this, DS_SOCKET_ID);
+                
+                    m_sock->SetNotify(wxSOCKET_CONNECTION_FLAG |
+                    wxSOCKET_INPUT_FLAG |
+                    wxSOCKET_LOST_FLAG);
+                    m_sock->Notify(TRUE);
+                    m_sock->SetTimeout(1);              // Short timeout
                 }
-                case UDP:{
-                    break;
+                
+                // Set up another socket for transmit
+                if(m_io_select != DS_TYPE_INPUT) {
+                    wxIPV4address tconn_addr;
+                    tconn_addr.Service(0);          // use ephemeral out port
+                    tconn_addr.AnyAddress();    
+                    m_tsock = new wxDatagramSocket(tconn_addr, wxSOCKET_NOWAIT | wxSOCKET_REUSEADDR);
+                    // Here would be the place to disable multicast loopback
+                    // but for consistency with broadcast behaviour, we will
+                    // instead rely on setting priority levels to ignore
+                    // sentences read back that have just been transmitted
+                    if ((!m_is_multicast) && ( m_addr.IPAddress().EndsWith(_T("255")))) {
+                        int broadcastEnable=1;
+                        bool bam = m_tsock->SetOption(SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
+                    }
                 }
-            }
-            
-            m_bok = true;
-        }
+                
+                break;
+                
+            default:
+                break;
+                
+        } 
+        m_bok = true;
+        
+    }  // NETWORK       
+    
+    else if(m_connection_type == INTERNAL_GPS){
+#ifdef __OCPN__ANDROID__
+        androidStartNMEA(m_consumer);
+        m_bok = true;
+#endif
+        
     }
+
+    else if(m_connection_type == INTERNAL_BT){
+#ifdef __OCPN__ANDROID__
+        m_bok = androidStartBT(m_consumer, m_portstring );
+#endif
+    }
+    
+        
+    else
+        m_bok = false;
+
+    m_connect_time = wxDateTime::Now();
+    
 }
 
 
@@ -325,6 +439,9 @@ void DataStream::Close()
     //    Kill off the TCP Socket if alive
     if(m_sock)
     {
+        if (m_is_multicast)
+            m_sock->SetOption(IPPROTO_IP,IP_DROP_MEMBERSHIP,&m_mrq, 
+                sizeof(m_mrq));
         m_sock->Notify(FALSE);
         m_sock->Destroy();
     }
@@ -335,10 +452,63 @@ void DataStream::Close()
         m_tsock->Destroy();
     }
     
+    if(m_socket_server)
+    {
+        m_socket_server->Notify(FALSE);
+        m_socket_server->Destroy();
+    }
+    
     //  Kill off the Garmin handler, if alive
     if(m_GarminHandler) {
         m_GarminHandler->Close();
         delete m_GarminHandler;
+    }
+    
+    m_socket_timer.Stop();
+    m_socketread_watchdog_timer.Stop();
+    
+    if(m_connection_type == INTERNAL_GPS){
+#ifdef __OCPN__ANDROID__
+        androidStopNMEA();
+#endif
+    }
+    else if(m_connection_type == INTERNAL_BT){
+#ifdef __OCPN__ANDROID__
+        androidStopBT();
+#endif
+    }
+    
+        
+}
+
+void DataStream::OnSocketReadWatchdogTimer(wxTimerEvent& event)
+{
+    m_dog_value--;
+    if( m_dog_value <= 0 ) {            // No receive in n seconds, assume connection lost
+        wxLogMessage( wxString::Format(_T("    TCP Datastream watchdog timeout: %s"), m_portstring.c_str()) );
+
+        if(m_net_protocol == TCP ) {
+            wxSocketClient* tcp_socket = dynamic_cast<wxSocketClient*>(m_sock);
+            if(tcp_socket) {
+                tcp_socket->Close();
+            }
+
+            m_socket_timer.Start(5000, wxTIMER_ONE_SHOT);    // schedule a reconnect
+            m_socketread_watchdog_timer.Stop();
+        }
+    }
+}
+
+void DataStream::OnTimerSocket(wxTimerEvent& event)
+{
+    //  Attempt a connection
+    wxSocketClient* tcp_socket = dynamic_cast<wxSocketClient*>(m_sock);
+    if(tcp_socket) {
+        if(tcp_socket->IsDisconnected() ) {
+            m_brx_connect_event = false;
+            tcp_socket->Connect(m_addr, FALSE);
+            m_socket_timer.Start(5000, wxTIMER_ONE_SHOT);    // schedule another attempt
+        }
     }
 }
 
@@ -373,30 +543,52 @@ void DataStream::OnSocketEvent(wxSocketEvent& event)
                 if(count)
                 {
                     data[count]=0;
-                    m_sock_buffer.Append(wxString::FromAscii(&data.front()));
+//                    m_sock_buffer.Append(data);
+                    m_sock_buffer += (&data.front());
                 }
             }
 
             bool done = false;
 
             while(!done){
-                size_t nmea_end = m_sock_buffer.find('*'); // detect the potential end of a NMEA string by finding the checkum marker
-                if(nmea_end != wxString::npos && nmea_end < m_sock_buffer.size()-2){
-                    nmea_end += 3; // move to the char after the 2 checksum digits
-                    wxString nmea_line = m_sock_buffer.substr(0,nmea_end);
-                    m_sock_buffer = m_sock_buffer.substr(nmea_end);
+                int nmea_tail = 2;
+                size_t nmea_end = m_sock_buffer.find_first_of("*\r\n"); // detect the potential end of a NMEA string by finding the checkum marker or EOL
 
-                    size_t nmea_start = nmea_line.find_last_of(_T("$!")); // detect the potential start of a NMEA string, skipping preceding chars that may look like the start of a string.
+                if (nmea_end == wxString::npos) // No termination characters: continue reading
+                    break;
+
+                if (m_sock_buffer[nmea_end] != '*')
+                    nmea_tail = -1;
+
+                if(nmea_end < m_sock_buffer.size() - nmea_tail){
+                    nmea_end += nmea_tail + 1; // move to the char after the 2 checksum digits, if present
+                    if ( nmea_end == 0 ) //The first character in the buffer is a terminator, skip it to avoid infinite loop
+                        nmea_end = 1;
+                    std::string nmea_line = m_sock_buffer.substr(0,nmea_end);
+
+                    //  If, due to some logic error, the {nmea_end} parameter is larger than the length of the
+                    //  socket buffer, then std::string::substr() will throw an exception.
+                    //  We don't want that, so test for it.
+                    //  If found, the simple solution is to clear the socket buffer, and carry on
+                    //  This has been seen on high volume TCP feeds, Windows only.
+                    //  Hard to catch.....
+                    if(nmea_end > m_sock_buffer.size())
+                        m_sock_buffer.clear();
+                    else
+                        m_sock_buffer = m_sock_buffer.substr(nmea_end);
+
+                    size_t nmea_start = nmea_line.find_last_of("$!"); // detect the potential start of a NMEA string, skipping preceding chars that may look like the start of a string.
                     if(nmea_start != wxString::npos){
                         nmea_line = nmea_line.substr(nmea_start);
+                        nmea_line += "\r\n";        // Add cr/lf, possibly superfluous
                         if( m_consumer && ChecksumOK(nmea_line)){
                             OCPN_DataStreamEvent Nevent(wxEVT_OCPN_DATASTREAM, 0);
-                            std::string s = std::string(nmea_line.mb_str());
-                            Nevent.SetNMEAString(s);
-                            Nevent.SetStreamName(std::string( GetPort().mb_str() ));
-                            Nevent.SetPriority(GetPriority());
+                            if(nmea_line.size()) {
+                                Nevent.SetNMEAString( nmea_line );
+                                Nevent.SetStream( this );
                             
-                            m_consumer->AddPendingEvent(Nevent);
+                                m_consumer->AddPendingEvent(Nevent);
+                            }
                         }
                     }
                 }
@@ -408,29 +600,59 @@ void DataStream::OnSocketEvent(wxSocketEvent& event)
             if(m_sock_buffer.size()>RD_BUF_SIZE)
                 m_sock_buffer = m_sock_buffer.substr(m_sock_buffer.size()-RD_BUF_SIZE);
 
+            m_dog_value = N_DOG_TIMEOUT;                // feed the dog
             break;
         }
 
         case wxSOCKET_LOST:
         {
-   //          wxSocketError e = m_sock->LastError();          // this produces wxSOCKET_WOULDBLOCK.
-            if(m_net_protocol == TCP) {
-                wxSocketClient* tcp_socket = dynamic_cast<wxSocketClient*>(m_sock);
-                tcp_socket->Connect(m_addr, FALSE);
+            //          wxSocketError e = m_sock->LastError();          // this produces wxSOCKET_WOULDBLOCK.
+            if(m_net_protocol == TCP || m_net_protocol == GPSD) {
+				if (m_brx_connect_event)
+					wxLogMessage(wxString::Format(_T("Datastream connection lost: %s"), m_portstring.c_str()));
+                if (m_socket_server) {
+                    m_sock->Destroy();
+                    m_sock=0;
+                    break;
+                }
+                wxDateTime now = wxDateTime::Now();
+                wxTimeSpan since_connect = now - m_connect_time;
+
+                int retry_time = 5000;          // default
+
+                //  If the socket has never connected, and it is a short interval since the connect request
+                //  then stretch the time a bit.  This happens on Windows if there is no dafault IP on any interface
+                
+                if(!m_brx_connect_event && (since_connect.GetSeconds() < 5) )
+                    retry_time = 10000;         // 10 secs
+                
+                m_socketread_watchdog_timer.Stop();
+                m_socket_timer.Start(retry_time, wxTIMER_ONE_SHOT);     // Schedule a re-connect attempt
+
                 break;
             }
         }
 
         case wxSOCKET_CONNECTION :
         {
-            if(m_net_protocol == GPSD)
-            {
+            if(m_net_protocol == GPSD) {
                 //      Sign up for watcher mode, Cooked NMEA
-                //      Notethat SIRF devices will be converted by gpsd into pseudo-NMEA
+                //      Note that SIRF devices will be converted by gpsd into pseudo-NMEA
                 char cmd[] = "?WATCH={\"class\":\"WATCH\", \"nmea\":true}";
                 m_sock->Write(cmd, strlen(cmd));
             }
+            else if(m_net_protocol == TCP) {
+                wxLogMessage( wxString::Format(_T("TCP Datastream connection established: %s"), m_portstring.c_str()) );
+                m_dog_value = N_DOG_TIMEOUT;                // feed the dog
+                if (m_io_select != DS_TYPE_OUTPUT)
+                    m_socketread_watchdog_timer.Start(1000);
+                if (m_io_select != DS_TYPE_INPUT && m_sock->IsOk())
+                    (void) SetOutputSocketOptions(m_sock);
+                m_socket_timer.Stop();
+                m_brx_connect_event = true;
+            }
 
+            m_connect_time = wxDateTime::Now();
             break;
         }
 
@@ -441,9 +663,36 @@ void DataStream::OnSocketEvent(wxSocketEvent& event)
 
 
 
-
-void DataStream::OnTimerNMEA(wxTimerEvent& event)
+void DataStream::OnServerSocketEvent(wxSocketEvent& event)
 {
+    
+    switch(event.GetSocketEvent())
+    {
+        case wxSOCKET_CONNECTION :
+        {
+            m_sock= m_socket_server->Accept(false);
+ 
+            if( m_sock) {
+                m_sock->SetTimeout(2);
+                m_sock->SetFlags( wxSOCKET_BLOCK );
+                m_sock->SetEventHandler(*this, DS_SOCKET_ID);
+                int notify_flags=(wxSOCKET_CONNECTION_FLAG | wxSOCKET_LOST_FLAG );
+                if (m_io_select != DS_TYPE_INPUT) {
+                    notify_flags |= wxSOCKET_OUTPUT_FLAG;
+                    (void) SetOutputSocketOptions(m_sock);
+                }
+                if (m_io_select != DS_TYPE_OUTPUT)
+                    notify_flags |= wxSOCKET_INPUT_FLAG;
+                m_sock->SetNotify(notify_flags);
+                m_sock->Notify(true);
+            }
+            
+            break;
+        }
+        
+        default :
+            break;
+    }
 }
 
 bool DataStream::SentencePassesFilter(const wxString& sentence, FilterDirection direction)
@@ -463,7 +712,6 @@ bool DataStream::SentencePassesFilter(const wxString& sentence, FilterDirection 
         if (m_output_filter_type == WHITELIST)
             listype = true;
     }
-
     if (filter.Count() == 0) //Empty list means everything passes
         return true;
 
@@ -490,25 +738,13 @@ bool DataStream::SentencePassesFilter(const wxString& sentence, FilterDirection 
     return !listype;
 }
 
-bool DataStream::ChecksumOK( const wxString &sentence )
+bool DataStream::ChecksumOK( const std::string &sentence )
 {
     if (!m_bchecksumCheck)
         return true;
 
-    size_t check_start = sentence.find('*');
-    if(check_start == wxString::npos || check_start > sentence.size() - 3)
-        return false; // * not found, or it didn't have 2 characters following it.
-
-    wxString check_str = sentence.substr(check_start+1,2);
-    unsigned long checksum;
-    if(!check_str.ToULong(&checksum,16))
-        return false;
-
-    unsigned char calculated_checksum = 0;
-    for(wxString::const_iterator i = sentence.begin()+1; i != sentence.end() && *i != '*'; ++i)
-        calculated_checksum ^= static_cast<unsigned char> (*i);
-
-    return calculated_checksum == checksum;
+    return CheckSumCheck(sentence);
+    
 }
 
 bool DataStream::SendSentence( const wxString &sentence )
@@ -518,1092 +754,80 @@ bool DataStream::SendSentence( const wxString &sentence )
         payload += _T("\r\n");
 
     switch( m_connection_type ) {
-        case SERIAL:
+        case SERIAL:{
             if( m_pSecondary_Thread ) {
-                wxDateTime then = wxDateTime::Now();
-                wxTimeSpan wait = wxDateTime::Now() - then;
-                while( (wait < wxTimeSpan(0,0,5,0)) && !IsSecThreadActive() ) {
-                    wait = wxDateTime::Now() - then;
-                }
                 if( IsSecThreadActive() )
                 {
                     int retry = 10;
                     while( retry ) {
-                        if(m_output_mutex.TryLock() == wxMUTEX_NO_ERROR) {
-                            if( !m_pSecondary_Thread->GetOutMsg().Length() ) {
-//                                printf("set\n");
-                                m_pSecondary_Thread->SetOutMsg( payload );
-                                m_output_mutex.Unlock();
-                                return true;
-                            }
-                            else {
-                                m_output_mutex.Unlock();
-//                                printf("sleep retry\n");
-                                wxMilliSleep(100);
-                                retry--;
-                            }
-                        }
-                        else {
+                        if( m_pSecondary_Thread->SetOutMsg( payload ))
+                            return true;
+                        else
                             retry--;
-//                            printf("mutex retry %d\n", retry);
-                        }
                     }
-                    return false;
+                    return false;   // could not send after several tries....
                 }
                 else
                     return false;
             }
             break;
-        case NETWORK:
-            if( m_sock ) {
-                switch(m_net_protocol){
-                    case GPSD:
-                    case TCP:{
-                        wxSocketClient* tcp_socket = dynamic_cast<wxSocketClient*>(m_sock);
-                        if( tcp_socket->IsDisconnected() )
-                            tcp_socket->Connect( m_addr, FALSE );
-                        else {
-                            tcp_socket->Write( payload.mb_str(), strlen( payload.mb_str() ) );
-                        }
-                    }
-                    break;
-                    case UDP:{
-                        wxDatagramSocket* udp_socket = dynamic_cast<wxDatagramSocket*>(m_tsock);
-                        if( udp_socket->IsOk() ) {
-                            udp_socket->SendTo(m_addr, payload.mb_str(), payload.size() );
-                        }
-                    }
-                }
-            }
-            break;
-    }
-    return true;
-}
-
-
-
-//-------------------------------------------------------------------------------------------------------------
-//
-//    Serial Input Thread
-//
-//    This thread manages reading the data stream from the declared serial port
-//
-//-------------------------------------------------------------------------------------------------------------
-
-//-------------------------------------------------------------------------------------------------------------
-//    OCP_DataStreamInput_Thread Implementation
-//-------------------------------------------------------------------------------------------------------------
-
-OCP_DataStreamInput_Thread::OCP_DataStreamInput_Thread(DataStream *Launcher,
-                                                       wxEvtHandler *MessageTarget,
-                                                       const wxString& PortName,
-                                                       const wxString& strBaudRate,
-                                                       wxMutex *pout_mutex,
-                                                       dsPortType io_select
-                                                      )
-{
-    m_launcher = Launcher;                          // This thread's immediate "parent"
-
-    m_pMessageTarget = MessageTarget;
-
-    m_PortName = PortName;
-
-    m_pout_mutex = pout_mutex;
-    m_io_select = io_select;
-    
-    rx_buffer = new char[DS_RX_BUFFER_SIZE + 1];
-    temp_buf = new char[DS_RX_BUFFER_SIZE + 1];
-
-    put_ptr = rx_buffer;                            // local circular queue
-    tak_ptr = rx_buffer;
-
-    m_baud = 4800;                                  // default
-    long lbaud;
-    if(strBaudRate.ToLong(&lbaud))
-        m_baud = (int)lbaud;
-
-    Create();
-}
-
-OCP_DataStreamInput_Thread::~OCP_DataStreamInput_Thread(void)
-{
-    delete[] rx_buffer;
-    delete[] temp_buf;
-}
-
-void OCP_DataStreamInput_Thread::OnExit(void)
-{
-}
-
-//      Sadly, the thread itself must implement the underlying OS serial port
-//      in a very machine specific way....
-
-#ifdef __POSIX__
-//    Entry Point
-void *OCP_DataStreamInput_Thread::Entry()
-{
-
-    bool not_done = true;
-    bool nl_found;
-    wxString msg;
-
-
-    //    Request the com port from the comm manager
-    if ((m_gps_fd = OpenComPortPhysical(m_PortName, m_baud)) < 0)
-    {
-        wxString msg(_T("NMEA input device open failed: "));
-        msg.Append(m_PortName);
-        ThreadMessage(msg);
-        goto thread_exit;
-    }
-
-    m_launcher->SetSecThreadActive();               // I am alive
-    
-
-//    The main loop
-
-    while((not_done) && (m_launcher->m_Thread_run_flag > 0))
-    {
-        if(TestDestroy())
-            not_done = false;                               // smooth exit
-
-      //    Blocking, timeout protected read of one character at a time
-      //    Timeout value is set by c_cc[VTIME]
-      //    Storing incoming characters in circular buffer
-      //    And watching for new line character
-      //     On new line character, send notification to parent
-        char next_byte = 0;
-        ssize_t newdata;
-        newdata = read(m_gps_fd, &next_byte, 1);            // read of one char
-                                                            // return (-1) if no data available, timeout
-
-#ifdef __WXOSX__
-        if (newdata < 0 )
-            wxThread::Sleep(100) ;
-#endif
-
-
-      // Fulup patch for handling hot-plug or wakeup events
-      // from serial port drivers
-        {
-              static int maxErrorLoop;
-
-              if (newdata > 0)
-              {
-        // we have data, so clear error
-                    maxErrorLoop =0;
-              }
-              else
-              {
-        // no need to retry every 1ms when on error
-                    sleep (1);
-
-        // if we have more no character for 5 second then try to reopen the port
-                    if (maxErrorLoop++ > 5)
-                    {
-
-        // do not retry for the next 5s
-                          maxErrorLoop = 0;
-
-        // free old unplug current port
-                          CloseComPortPhysical(m_gps_fd);
-        //    Request the com port from the comm manager
-                          if ((m_gps_fd = OpenComPortPhysical(m_PortName, m_baud)) < 0)  {
-//                                wxString msg(_T("NMEA input device open failed (will retry): "));
-//                                msg.Append(m_PortName);
-//                                ThreadMessage(msg);
-                          } else {
-                                wxString msg(_T("NMEA input device open on hotplug OK: "));
-                                msg.Append(m_PortName);
-                                ThreadMessage(msg);
-                          }
-                    }
-              }
-        } 
-
-        //  And process any character
-
-        if(newdata > 0)
-        {
-        //                    printf("%c", next_byte);
-            nl_found = false;
-            *put_ptr++ = next_byte;
-            if((put_ptr - rx_buffer) > DS_RX_BUFFER_SIZE)
-            put_ptr = rx_buffer;
-
-            if(0x0a == next_byte)
-            nl_found = true;
-
-
-            //    Found a NL char, thus end of message?
-            if(nl_found)
-            {
-                char *tptr;
-                char *ptmpbuf;
-
-                //    Copy the message into a temporary _buffer
-
-                tptr = tak_ptr;
-                ptmpbuf = temp_buf;
-
-                while((*tptr != 0x0a) && (tptr != put_ptr))
-                {
-                    *ptmpbuf++ = *tptr++;
-
-                    if((tptr - rx_buffer) > DS_RX_BUFFER_SIZE)
-                    tptr = rx_buffer;
-
-                    wxASSERT_MSG((ptmpbuf - temp_buf) < DS_RX_BUFFER_SIZE, (const wxChar *)"temp_buf overrun1");
-
-                }
-                if((*tptr == 0x0a) && (tptr != put_ptr))    // well formed sentence
-                {
-                    *ptmpbuf++ = *tptr++;
-                    if((tptr - rx_buffer) > DS_RX_BUFFER_SIZE)
-                    tptr = rx_buffer;
-
-                    wxASSERT_MSG((ptmpbuf - temp_buf) < DS_RX_BUFFER_SIZE, (const wxChar *)"temp_buf overrun2");
-
-                    *ptmpbuf = 0;
-
-                    tak_ptr = tptr;
-
-                //    Message is ready to parse and send out
-                    wxString str_temp_buf(temp_buf, wxConvUTF8);
-                    Parse_And_Send_Posn(str_temp_buf);
-                }
-
-            }                   //if nl
-        }                       // if newdata > 0
-        
-        //      Check for any pending output message
-        if( m_pout_mutex && (wxMUTEX_NO_ERROR == m_pout_mutex->Lock()) ){
-            if( !m_outmsg.IsEmpty() ) {
-//                printf("write\n");
-                WriteComPortPhysical(m_gps_fd, m_outmsg);
-                m_outmsg.Clear();
-            }
-            m_pout_mutex->Unlock();
-        }
-    }                          // the big while...
-
-//          Close the port cleanly
-    CloseComPortPhysical(m_gps_fd);
-
-thread_exit:
-    m_launcher->SetSecThreadInActive();             // I am dead
-    m_launcher->m_Thread_run_flag = -1;
-
-    return 0;
-}
-
-
-#endif          //__POSIX__
-
-
-#ifdef __WXMSW__
-
-//    Entry Point
-void *OCP_DataStreamInput_Thread::Entry()
-{
-    wxString msg;
-
-
-
-    bool not_done;
-    HANDLE hSerialComm = (HANDLE)(-1);
-
-       //    Request the com port from the comm manager
-    if ((m_gps_fd = OpenComPortPhysical(m_PortName, m_baud)) < 0)
-    {
-        wxString msg(_T("NMEA input device open failed: "));
-        msg.Append(m_PortName);
-        wxString msg_error;
-        msg_error.Printf(_T("...GetLastError():  %d"), GetLastError());
-        msg.Append(msg_error);
-
-        ThreadMessage(msg);
-        goto thread_exit;
-    }
-
-    m_launcher->SetSecThreadActive();               // I am alive
-    hSerialComm = (HANDLE)m_gps_fd;
-
-
-    //  If port supports output, set a short timeout so that output polling mechanism works
-    int max_timeout = 5;
-    int loop_timeout = 2000;
-    int n_reopen_wait = 2000;
-    if( (m_io_select == DS_TYPE_INPUT_OUTPUT) || (m_io_select == DS_TYPE_OUTPUT) ) {
-        loop_timeout = 2;
-        max_timeout = 5000;
-    }
-    
-    COMMTIMEOUTS timeouts;
-    
-    timeouts.ReadIntervalTimeout = MAXDWORD;
-    timeouts.ReadTotalTimeoutMultiplier = MAXDWORD;
-    timeouts.ReadTotalTimeoutConstant = loop_timeout;
-    timeouts.WriteTotalTimeoutMultiplier = MAXDWORD;
-    timeouts.WriteTotalTimeoutConstant = MAXDWORD;
-    
-    if (!SetCommTimeouts((HANDLE)m_gps_fd, &timeouts)) // Error setting time-outs.
-        goto thread_exit;
-    
-    
-    
-    not_done = true;
-    bool nl_found;
-
-#define READ_BUF_SIZE 200
-    char szBuf[READ_BUF_SIZE];
-
-    DWORD dwRead;
-    DWORD dwOneRead;
-    char  chRead;
-    int ic;
-    int n_timeout;
-
-//    The main loop
-
-    while((not_done) && (m_launcher->m_Thread_run_flag > 0))
-    {
-        if(TestDestroy())
-            not_done = false;                               // smooth exit
-
-       //    Was port closed due to error condition?
-        while(!m_gps_fd)
-        {
-            if((TestDestroy()) || (m_launcher->m_Thread_run_flag == 0))
-                goto thread_exit;                               // smooth exit
-
-            if(n_reopen_wait)
-            {
-                wxThread::Sleep(n_reopen_wait);                        // stall for a bit
-                n_reopen_wait = 0;
-            }
-
-
-            if ((m_gps_fd = OpenComPortPhysical(m_PortName, m_baud)) > 0)
-            {
-                hSerialComm = (HANDLE)m_gps_fd;
-                
-                if(!SetCommMask((HANDLE)m_gps_fd, EV_RXCHAR)) // Setting Event Type
-                    goto thread_exit;
-        
-                COMMTIMEOUTS timeouts;
-                timeouts.ReadIntervalTimeout = MAXDWORD;
-                timeouts.ReadTotalTimeoutMultiplier = MAXDWORD;
-                timeouts.ReadTotalTimeoutConstant = loop_timeout;
-                timeouts.WriteTotalTimeoutMultiplier = MAXDWORD;
-                timeouts.WriteTotalTimeoutConstant = MAXDWORD;
-        
-                if (!SetCommTimeouts((HANDLE)m_gps_fd, &timeouts)) // Error setting time-outs.
-                    goto thread_exit;
-            }
-            else
-            {
-                m_gps_fd = NULL;
-                wxThread::Sleep(2000);                        // stall for a bit
-            }
-        }
-
-        //      Check for any pending output message
-        if( m_pout_mutex && (wxMUTEX_NO_ERROR == m_pout_mutex->Lock()) ){
-            if( !m_outmsg.IsEmpty() ) {
-//                printf("write0\n");
-                WriteComPortPhysical(m_gps_fd, m_outmsg);
-                m_outmsg.Clear();
-            }
-            m_pout_mutex->Unlock();
-        }
-        
-
-        bool b_inner = true;
-        bool b_sleep = false;
-        dwRead = 0;
-        n_timeout = 0;
-        wxDateTime now = wxDateTime::Now();
-        int t = now.GetTicks();                 // set a separate timer not controlled by serial port
-        ic=0;
-        while( b_inner ) {
-            if( b_sleep )                       // we need a sleep if the serial port does not honor commtimeouts
-                wxSleep(1);
-            if(ReadFile((HANDLE)m_gps_fd, &chRead, 1, &dwOneRead, NULL))
-            {
-                if(1 == dwOneRead) {
-                    b_sleep = false;
-                    szBuf[ic] = chRead;
-                    dwRead++;
-                    if(++ic > READ_BUF_SIZE - 1)
-                        goto HandleASuccessfulRead;
-                    if(chRead == 0x0a)
-                        goto HandleASuccessfulRead;
-                }
-                else {                          // timed out
-                    n_timeout++;;
-                    if( n_timeout > max_timeout ) {
-
-                        bool b_close = true;
-                        
-                        //  If the port is input only, double check the timeout
-                        //  We do this since some virtual serial port emulators
-                        //  do not seem to honor SetCommTimeouts() function
-                        if( m_io_select == DS_TYPE_INPUT ) {
-                            wxDateTime then = wxDateTime::Now();
-                            int tt = then.GetTicks();
-                            if( (tt - t) <  (max_timeout * loop_timeout)/1000 ) {
-                                b_close = false;
-                                n_timeout = 0;
-                                b_sleep = true;
-                            }
-                        }
-                            
-                        if( b_close ) {
-                            b_inner = false;
-                            CloseComPortPhysical(m_gps_fd);
-                            m_gps_fd = NULL;
-                            dwRead = 0;
-                            nl_found = false;
-                            n_reopen_wait = 2000;
-                        }
-                    }
-                    else if((TestDestroy()) || (m_launcher->m_Thread_run_flag == 0)) {
-                        goto thread_exit;                               // smooth exit
-                    }
-                    
-                    else {
-                        //      Check for any pending output message
-                        if( m_pout_mutex && (wxMUTEX_NO_ERROR == m_pout_mutex->Lock()) ){
-                            if( !m_outmsg.IsEmpty() ) {
-//                                printf("write1\n");
-                                WriteComPortPhysical(m_gps_fd, m_outmsg);
-                                m_outmsg.Clear();
-                            }
-                            m_pout_mutex->Unlock();
-                            
-                        }
-
-                    }
-                }
-            }
-            else {
-                //      ReadFile Erorr
-            }
         }
             
-HandleASuccessfulRead:
+        case NETWORK:{
+            if(m_txenter)
+                return false;                 // do not allow recursion, could happen with non-blocking sockets
+            m_txenter++;
 
-        if(dwRead > 0)
-        {
-              if((g_total_NMEAerror_messages < g_nNMEADebug) && (g_nNMEADebug > 1000))
-              {
-                    g_total_NMEAerror_messages++;
-                    wxString msg;
-                    msg.Printf(_T("NMEA activity...%d bytes"), dwRead);
-                    ThreadMessage(msg);
-              }
+            bool ret = true;
+            wxDatagramSocket* udp_socket;
+                switch(m_net_protocol){
+                    case TCP:
+                        if( m_sock && m_sock->IsOk() ) {
+                            m_sock->Write( payload.mb_str(), strlen( payload.mb_str() ) );
+                            if(m_sock->Error()){
+                                if (m_socket_server) {
+                                    m_sock->Destroy();
+                                    m_sock= 0;
+                                } else {
+                                    wxSocketClient* tcp_socket = dynamic_cast<wxSocketClient*>(m_sock);
+                                    tcp_socket->Close();
+                                    m_socket_timer.Start(5000, wxTIMER_ONE_SHOT);    // schedule a reconnect
+                                    m_socketread_watchdog_timer.Stop();
+                                }
+                                ret = false;
+                            }
 
-              int nchar = dwRead;
-              char *pb = szBuf;
-
-              while(nchar)
-              {
-                    if(0x0a == *pb)
-                          nl_found = true;
-
-                    *put_ptr++ = *pb++;
-                    if((put_ptr - rx_buffer) > DS_RX_BUFFER_SIZE)
-                          put_ptr = rx_buffer;
-
-                    nchar--;
-              }
-              if((g_total_NMEAerror_messages < g_nNMEADebug) && (g_nNMEADebug > 1000))
-              {
-                    g_total_NMEAerror_messages++;
-                    wxString msg1 = _T("Buffer is: ");
-                    int nc = dwRead;
-                    char *pb = szBuf;
-                    while(nc)
-                    {
-                          msg1.Append(*pb++);
-                          nc--;
-                    }
-                    ThreadMessage(msg1);
-              }
+                        }
+                        else
+                            ret = false;
+                        break;
+                    case UDP:
+                        udp_socket = dynamic_cast<wxDatagramSocket*>(m_tsock);
+                        if( udp_socket->IsOk() ) {
+                            udp_socket->SendTo(m_addr, payload.mb_str(), payload.size() );
+                            if( udp_socket->Error())
+                                ret = false;
+                        }
+                        else
+                            ret = false;
+                        break;
+                    
+                    case GPSD:    
+                    default:
+                        ret = false;
+                        break;
+            }
+            m_txenter--;
+            return ret;
+            break;
         }
-
-//    Found a NL char, thus end of message?
-        if(nl_found)
-        {
-            char *tptr;
-            char *ptmpbuf;
-
-            bool partial = false;
-            while (!partial)
-            {
-
-            //    Copy the message into a temp buffer
-
-                tptr = tak_ptr;
-                ptmpbuf = temp_buf;
-
-                while((*tptr != 0x0a) && (tptr != put_ptr))
-                {
-                    *ptmpbuf++ = *tptr++;
-
-                    if((tptr - rx_buffer) > RX_BUFFER_SIZE)
-                        tptr = rx_buffer;
-//                    wxASSERT_MSG((ptmpbuf - temp_buf) < DS_RX_BUFFER_SIZE, "temp_buf overrun");
-                }
-
-                if((*tptr == 0x0a) && (tptr != put_ptr))    // well formed sentence
-                {
-                    *ptmpbuf++ = *tptr++;
-                    if((tptr - rx_buffer) > DS_RX_BUFFER_SIZE)
-                        tptr = rx_buffer;
-//                    wxASSERT_MSG((ptmpbuf - temp_buf) < DS_RX_BUFFER_SIZE, "temp_buf overrun");
-
-                    *ptmpbuf = 0;
-
-                    tak_ptr = tptr;
-
-                    // parse and send the message
-//                    if(g_bShowOutlines)
-                    {
-                        wxString str_temp_buf(temp_buf, wxConvUTF8);
-                        Parse_And_Send_Posn(str_temp_buf);
-                    }
-                }
-                else
-                {
-                    partial = true;
-                }
-            }                 // while !partial
-
-        }           // nl found
-    }           // the big while...
-
-
-
-thread_exit:
-
-//          Close the port cleanly
-    CloseComPortPhysical(m_gps_fd);
-
-    m_launcher->SetSecThreadInActive();             // I am dead
-    m_launcher->m_Thread_run_flag = -1;
-
-    return 0;
-
-}
-
-#endif            // __WXMSW__
-
-void OCP_DataStreamInput_Thread::Parse_And_Send_Posn(wxString &str_temp_buf)
-{
-    OCPN_DataStreamEvent Nevent(wxEVT_OCPN_DATASTREAM, 0);
-    std::string s = std::string(str_temp_buf.mb_str());
-    Nevent.SetNMEAString(s);
-    Nevent.SetStreamName(std::string( m_launcher->GetPort().mb_str() ));
-    Nevent.SetPriority(m_launcher->GetPriority());
-    
-    if( m_pMessageTarget )
-        m_pMessageTarget->AddPendingEvent(Nevent);
-
-    return;
-}
-
-
-void OCP_DataStreamInput_Thread::ThreadMessage(const wxString &msg)
-{
-    //    Signal the main program thread
-    wxCommandEvent event( EVT_THREADMSG,  GetId());
-    event.SetEventObject( (wxObject *)this );
-    event.SetString(msg);
-    if( m_pMessageTarget )
-        m_pMessageTarget->AddPendingEvent(event);
-}
-
-void OCP_DataStreamInput_Thread::SetOutMsg(wxString msg)
-{
-    //  Assume that the caller owns the mutex
-    m_outmsg = msg.c_str();
-}
-
-
-
-#ifdef __POSIX__
-
-int OCP_DataStreamInput_Thread::OpenComPortPhysical(wxString &com_name, int baud_rate)
-{
-
-    // Declare the termios data structures
-    termios ttyset_old;
-    termios ttyset;
-
-    // Open the serial port.
-    int com_fd;
-    if ((com_fd = open(com_name.mb_str(), O_RDWR|O_NONBLOCK|O_NOCTTY)) < 0)
-        return com_fd;
-
-    speed_t baud_parm;
-    switch(baud_rate)
-    {
-        case 4800:
-              baud_parm = B4800;
-              break;
-        case 9600:
-              baud_parm = B9600;
-              break;
-        case 38400:
-              baud_parm = B38400;
-              break;
+         
         default:
-              baud_parm = B4800;
-              break;
-    }
-
-    if (isatty(com_fd) != 0)
-    {
-        /* Save original terminal parameters */
-        if (tcgetattr(com_fd,&ttyset_old) != 0)
-            return -128;
-
-        memcpy(&ttyset, &ttyset_old, sizeof(termios));
-
-    //  Build the new parms off the old
-
-    //  Baud Rate
-        cfsetispeed(&ttyset, baud_parm);
-        cfsetospeed(&ttyset, baud_parm);
-
-        tcsetattr(com_fd, TCSANOW, &ttyset);
-
-    // Set blocking/timeout behaviour
-        memset(ttyset.c_cc,0,sizeof(ttyset.c_cc));
-        ttyset.c_cc[VTIME] = 5;                        // 0.5 sec timeout
-        fcntl(com_fd, F_SETFL, fcntl(com_fd, F_GETFL) & !O_NONBLOCK);
-
-    // No Flow Control
-
-        ttyset.c_cflag &= ~(PARENB | PARODD | CRTSCTS);
-        ttyset.c_cflag |= CREAD | CLOCAL;
-        ttyset.c_iflag = ttyset.c_oflag = ttyset.c_lflag = (tcflag_t) 0;
-
-        int stopbits = 1;
-        char parity = 'N';
-        ttyset.c_iflag &=~ (PARMRK | INPCK);
-        ttyset.c_cflag &=~ (CSIZE | CSTOPB | PARENB | PARODD);
-        ttyset.c_cflag |= (stopbits==2 ? CS7|CSTOPB : CS8);
-        switch (parity)
-        {
-            case 'E':
-                ttyset.c_iflag |= INPCK;
-                ttyset.c_cflag |= PARENB;
-                break;
-            case 'O':
-                ttyset.c_iflag |= INPCK;
-                ttyset.c_cflag |= PARENB | PARODD;
-                break;
-        }
-        ttyset.c_cflag &=~ CSIZE;
-        ttyset.c_cflag |= (CSIZE & (stopbits==2 ? CS7 : CS8));
-        if (tcsetattr(com_fd, TCSANOW, &ttyset) != 0)
-            return -129;
-
-        tcflush(com_fd, TCIOFLUSH);
-    }
-
-    return com_fd;
-}
-
-
-int OCP_DataStreamInput_Thread::CloseComPortPhysical(int fd)
-{
-    close(fd);
-
-    return 0;
-}
-
-
-int OCP_DataStreamInput_Thread::WriteComPortPhysical(int port_descriptor, const wxString& string)
-{
-    ssize_t status;
-    status = write(port_descriptor, string.mb_str(), string.Len());
-    
-    return status;
-}
-
-int OCP_DataStreamInput_Thread::WriteComPortPhysical(int port_descriptor, unsigned char *msg, int count)
-{
-    ssize_t status;
-    status = write(port_descriptor, msg, count);
-    return status;
-}
-
-int OCP_DataStreamInput_Thread::ReadComPortPhysical(int port_descriptor, int count, unsigned char *p)
-{
-//    Blocking, timeout protected read of one character at a time
-//    Timeout value is set by c_cc[VTIME]
-
-    return read(port_descriptor, p, count);            // read of (count) characters
-}
-
-
-bool OCP_DataStreamInput_Thread::CheckComPortPhysical(int port_descriptor)
-{
-    fd_set rec;
-    struct timeval t;
-//      posix_serial_data *psd = (posix_serial_data *)port_descriptor;
-//      int fd = psd->fd;
-
-    int fd = port_descriptor;
-    FD_ZERO(&rec);
-    FD_SET(fd,&rec);
-
-    t.tv_sec  = 0;
-    t.tv_usec = 1000;
-    (void) select(fd+1,&rec,NULL,NULL,&t);
-    if(FD_ISSET(fd,&rec))
-        return true;
-
-    return false;
-}
-
-
-#endif            // __POSIX__
-
-#ifdef __WXMSW__
-int OCP_DataStreamInput_Thread::OpenComPortPhysical(wxString &com_name, int baud_rate)
-{
-
-//    Set up the serial port
-    wxString xcom_name = com_name;
-    xcom_name.Prepend(_T("\\\\.\\"));                  // Required for access to Serial Ports greater than COM9
-
-    DWORD open_flags = 0;
-
-    HANDLE hSerialComm = CreateFile(xcom_name.fn_str(),      // Port Name
-                             GENERIC_READ | GENERIC_WRITE,     // Desired Access
-                             0,                               // Shared Mode
-                             NULL,                            // Security
-                             OPEN_EXISTING,             // Creation Disposition
-                             open_flags,
-                             NULL);
-
-    if(hSerialComm == INVALID_HANDLE_VALUE)
-    {
-        return (0 - abs((int)::GetLastError()));
-    }
-
-    DWORD err;
-    COMSTAT cs;
-    ClearCommError(hSerialComm, &err, &cs);
-    
-    if(!SetupComm(hSerialComm, 1024, 1024))
-    {
-        return (0 - abs((int)::GetLastError()));
-    }
-
-    DCB dcbConfig;
-
-    if(GetCommState(hSerialComm, &dcbConfig))           // Configuring Serial Port Settings
-    {
-        dcbConfig.BaudRate = baud_rate;
-        dcbConfig.ByteSize = 8;
-        dcbConfig.Parity = NOPARITY;
-        dcbConfig.StopBits = ONESTOPBIT;
-        dcbConfig.fBinary = TRUE;
-        dcbConfig.fRtsControl = RTS_CONTROL_ENABLE;
-        dcbConfig.fDtrControl = DTR_CONTROL_ENABLE;
-        dcbConfig.fOutxDsrFlow = false;
-        dcbConfig.fOutxCtsFlow = false;
-        dcbConfig.fDsrSensitivity = false;
-        dcbConfig.fOutX = false;
-        dcbConfig.fInX = false;
-        dcbConfig.fInX = false;
-        dcbConfig.fInX = false;
-    }
-
-    else
-    {
-        return (0 - abs((int)::GetLastError()));
-    }
-
-    if(!SetCommState(hSerialComm, &dcbConfig))
-    {
-        return (0 - abs((int)::GetLastError()));
-    }
-
-    COMMTIMEOUTS commTimeout;
-    int TimeOutInSec = 2;
-    commTimeout.ReadIntervalTimeout = 1000*TimeOutInSec;
-    commTimeout.ReadTotalTimeoutConstant = 1000*TimeOutInSec;
-    commTimeout.ReadTotalTimeoutMultiplier = 0;
-    commTimeout.WriteTotalTimeoutConstant = 1000*TimeOutInSec;
-    commTimeout.WriteTotalTimeoutMultiplier = 0;
-
-    if(!SetCommTimeouts(hSerialComm, &commTimeout))
-    {
-        return (0 - abs((int)::GetLastError()));
-    }
-
-    return (int)hSerialComm;
-}
-
-int OCP_DataStreamInput_Thread::CloseComPortPhysical(int fd)
-{
-    if((HANDLE)fd != INVALID_HANDLE_VALUE)
-        CloseHandle((HANDLE)fd);
-    return 0;
-}
-
-int OCP_DataStreamInput_Thread::WriteComPortPhysical(int port_descriptor, const wxString& string)
-{
-    unsigned int dwSize = string.Len();
-    char *pszBuf = (char *)malloc((dwSize + 1) * sizeof(char));
-    strncpy(pszBuf, string.mb_str(), dwSize+1);
-
-    DWORD dwWritten;
-    int fRes;
-
-    // Issue write.
-    if (!WriteFile((HANDLE)port_descriptor, pszBuf, dwSize, &dwWritten, NULL))
-        fRes = 0;         // WriteFile failed, . Report error and abort.
-    else
-        fRes = dwWritten;      // WriteFile completed immediately.
-
-    free (pszBuf);
-
-
-    return fRes;
-}
-
-int OCP_DataStreamInput_Thread::WriteComPortPhysical(int port_descriptor, unsigned char *msg, int count)
-{
-    return 0;
-}
-
-int OCP_DataStreamInput_Thread::ReadComPortPhysical(int port_descriptor, int count, unsigned char *p)
-{
-    return 0;
-}
-
-
-bool OCP_DataStreamInput_Thread::CheckComPortPhysical(int port_descriptor)
-{
-    return false;
-}
-
-#endif            // __WXMSW__
-
-//ConnectionParams implementation
-ConnectionParams::ConnectionParams( wxString &configStr )
-{
-    Deserialize( configStr );
-}
-
-void ConnectionParams::Deserialize(wxString &configStr)
-{
-    Valid = true;
-    wxArrayString prms = wxStringTokenize( configStr, _T(";") );
-    if (prms.Count() < 17) {
-        Valid = false;
-        return;
+            break;
     }
     
-    Type = (ConnectionType)wxAtoi(prms[0]);
-    NetProtocol = (NetworkProtocol)wxAtoi(prms[1]);
-    NetworkAddress = prms[2];
-    NetworkPort = (ConnectionType)wxAtoi(prms[3]);
-    Protocol = (DataProtocol)wxAtoi(prms[4]);
-    Port = prms[5];
-    Baudrate = wxAtoi(prms[6]);
-    ChecksumCheck = !!wxAtoi(prms[7]);
-    Output = !!wxAtoi(prms[8]);
-    InputSentenceListType = (ListType)wxAtoi(prms[9]);
-    InputSentenceList = wxStringTokenize(prms[10], _T(","));
-    OutputSentenceListType = (ListType)wxAtoi(prms[11]);
-    OutputSentenceList = wxStringTokenize(prms[12], _T(","));
-    Priority = wxAtoi(prms[13]);
-    Garmin = !!wxAtoi(prms[14]);
-    GarminUpload = !!wxAtoi(prms[15]);
-    FurunoGP3X = !!wxAtoi(prms[16]);
-
-    bEnabled = true;
-    if (prms.Count() >= 18) 
-        bEnabled = !!wxAtoi(prms[17]);
+    return true;
 }
-
-wxString ConnectionParams::Serialize()
-{
-    wxString istcs;
-    for( size_t i = 0; i < InputSentenceList.Count(); i++ )
-    {
-        if (i > 0)
-            istcs.Append( _T(",") );
-        istcs.Append( InputSentenceList[i] );
-    }
-    wxString ostcs;
-    for( size_t i = 0; i < OutputSentenceList.Count(); i++ )
-    {
-        if (i > 0)
-            ostcs.Append( _T(",") );
-        ostcs.Append( OutputSentenceList[i] );
-    }
-    wxString ret = wxString::Format( _T("%d;%d;%s;%d;%d;%s;%d;%d;%d;%d;%s;%d;%s;%d;%d;%d;%d;%d"),
-                                     Type,
-                                     NetProtocol,
-                                     NetworkAddress.c_str(),
-                                     NetworkPort,
-                                     Protocol,
-                                     Port.c_str(),
-                                     Baudrate,
-                                     ChecksumCheck,
-                                     Output,
-                                     InputSentenceListType,
-                                     istcs.c_str(),
-                                     OutputSentenceListType,
-                                     ostcs.c_str(),
-                                     Priority,
-                                     Garmin,
-                                     GarminUpload,
-                                     FurunoGP3X,
-                                     bEnabled
-                                   );
-
-    return ret;
-}
-
-ConnectionParams::ConnectionParams()
-{
-    Type = SERIAL;
-    NetProtocol = TCP;
-    NetworkAddress = wxEmptyString;
-    NetworkPort = 0;
-    Protocol = PROTO_NMEA0183;
-    Port = wxEmptyString;
-    Baudrate = 4800;
-    ChecksumCheck = true;
-    Garmin = false;
-    FurunoGP3X = false;
-    Output = false;
-    InputSentenceListType = WHITELIST;
-    OutputSentenceListType = WHITELIST;
-    Priority = 0;
-    Valid = true;
-    bEnabled = true;
-}
-
-wxString ConnectionParams::GetSourceTypeStr()
-{
-    if ( Type == SERIAL )
-        return _("Serial");
-    else
-        return _("Net");
-}
-
-wxString ConnectionParams::GetAddressStr()
-{
-    if ( Type == SERIAL )
-        return wxString::Format( _T("%s"), Port.c_str() );
-    else
-        return wxString::Format( _T("%s:%d"), NetworkAddress.c_str(), NetworkPort );
-}
-
-wxString ConnectionParams::GetParametersStr()
-{
-    if ( Type == SERIAL )
-        return wxString::Format( _T("%d"), Baudrate );
-    else
-        if ( NetProtocol == TCP )
-            return _("TCP");
-        else if (NetProtocol == UDP)
-            return _("UDP");
-        else
-            return _("GPSD");
-}
-
-wxString ConnectionParams::GetOutputValueStr()
-{
-    if ( Output )
-        return _("Yes");
-    else
-        return _("No");
-}
-
-wxString ConnectionParams::FilterTypeToStr(ListType type, FilterDirection dir)
-{
-    if(dir == FILTER_INPUT) {
-        if ( type == BLACKLIST )
-            return _("Reject");
-        else
-            return _("Accept");
-    }
-    else {
-        if ( type == BLACKLIST )
-            return _("Drop");
-        else
-            return _("Send");
-    }
-}
-
-wxString ConnectionParams::GetFiltersStr()
-{
-    wxString istcs;
-    for( size_t i = 0; i < InputSentenceList.Count(); i++ )
-    {
-        if ( i > 0 )
-            istcs.Append( _T(",") );
-        istcs.Append( InputSentenceList[i] );
-    }
-    wxString ostcs;
-    for( size_t i = 0; i < OutputSentenceList.Count(); i++ )
-    {
-        if ( i > 0 )
-            ostcs.Append( _T(",") );
-        ostcs.Append( OutputSentenceList[i] );
-    }
-    wxString ret = wxEmptyString;
-    if ( istcs.Len() > 0 ){
-        ret.Append( _("In") );
-        ret.Append(wxString::Format( _T(": %s %s"),
-                                     FilterTypeToStr(InputSentenceListType, FILTER_INPUT).c_str(), istcs.c_str()) );
-    }
-    else
-        ret.Append( _("In: None") );
-    
-    if ( ostcs.Len() > 0 ){
-        ret.Append(  _T(", ") );
-        ret.Append(  _("Out") );
-        ret.Append( wxString::Format( _T(": %s %s"),
-                                      FilterTypeToStr(OutputSentenceListType, FILTER_OUTPUT).c_str(), ostcs.c_str() ) );
-    }
-    else
-        ret.Append( _(", Out: None") );
-    return  ret;
-}
-
-wxString ConnectionParams::GetDSPort()
-{
-    if ( Type == SERIAL )
-        return wxString::Format( _T("Serial:%s"), Port.c_str() );
-    else
-    {
-        wxString proto;
-        if ( NetProtocol == TCP )
-            proto = _T("TCP");
-        else if (NetProtocol == UDP)
-            proto = _T("UDP");
-        else
-            proto = _T("GPSD");
-        return wxString::Format( _T("%s:%s:%d"), proto.c_str(), NetworkAddress.c_str(), NetworkPort );
-    }
-}
-
-
-
 
 //----------------------------------------------------------------------------
 // Garmin Device Management
@@ -1847,7 +1071,7 @@ void GarminProtocolHandler::OnTimerGarmin1(wxTimerEvent& event)
                 
                 //    Start the pump
                 m_garmin_usb_thread = new GARMIN_USB_Thread(this, m_pparent,
-						m_pMainEventHandler, (int)m_usb_handle, m_max_tx_size);
+						m_pMainEventHandler, (wxIntPtr)m_usb_handle, m_max_tx_size);
                 m_Thread_run_flag = 1;
                 m_garmin_usb_thread->Run();
             }
@@ -1881,7 +1105,7 @@ bool GarminProtocolHandler::ResetGarminUSBDriver()
     SP_DEVINFO_DATA devInfo;
     SP_PROPCHANGE_PARAMS pchange;
     
-    devs = SetupDiGetClassDevs( (GUID *) &GARMIN_GUID, NULL, NULL,
+    devs = SetupDiGetClassDevs( (GUID *) &GARMIN_GUID1, NULL, NULL,
                                 DIGCF_PRESENT | DIGCF_INTERFACEDEVICE);
     if (devs == INVALID_HANDLE_VALUE)
         return false;
@@ -1925,7 +1149,7 @@ bool GarminProtocolHandler::FindGarminDeviceInterface()
 HDEVINFO hdevinfo;
 SP_DEVINFO_DATA devInfo;
 
-hdevinfo = SetupDiGetClassDevs( (GUID *) &GARMIN_GUID, NULL, NULL,
+hdevinfo = SetupDiGetClassDevs( (GUID *) &GARMIN_GUID1, NULL, NULL,
                                 DIGCF_PRESENT | DIGCF_INTERFACEDEVICE);
 
 if (hdevinfo != INVALID_HANDLE_VALUE)
@@ -1949,7 +1173,7 @@ bool GarminProtocolHandler::IsGarminPlugged()
     SP_DEVICE_INTERFACE_DATA infodata;
     
     //    Search for the Garmin Device Interface Class
-    hdevinfo = SetupDiGetClassDevs( (GUID *) &GARMIN_GUID, NULL, NULL,
+    hdevinfo = SetupDiGetClassDevs( (GUID *) &GARMIN_GUID1, NULL, NULL,
                                     DIGCF_PRESENT | DIGCF_INTERFACEDEVICE);
     
     if (hdevinfo == INVALID_HANDLE_VALUE)
@@ -1958,7 +1182,7 @@ bool GarminProtocolHandler::IsGarminPlugged()
     infodata.cbSize = sizeof(infodata);
     
     bool bgarmin_unit_found = (SetupDiEnumDeviceInterfaces(hdevinfo,
-                                                           NULL,(GUID *) &GARMIN_GUID, 0, &infodata) != 0);
+                                                           NULL,(GUID *) &GARMIN_GUID1, 0, &infodata) != 0);
     
     if(!bgarmin_unit_found)
         return false;
@@ -1994,7 +1218,7 @@ HANDLE GarminProtocolHandler::garmin_usb_start()
     SP_DEVICE_INTERFACE_DATA infodata;
     
     //    Search for the Garmin Device Interface Class
-    hdevinfo = SetupDiGetClassDevs( (GUID *) &GARMIN_GUID, NULL, NULL,
+    hdevinfo = SetupDiGetClassDevs( (GUID *) &GARMIN_GUID1, NULL, NULL,
                                     DIGCF_PRESENT | DIGCF_INTERFACEDEVICE);
     
     if (hdevinfo == INVALID_HANDLE_VALUE)
@@ -2003,7 +1227,7 @@ HANDLE GarminProtocolHandler::garmin_usb_start()
     infodata.cbSize = sizeof(infodata);
     
     bool bgarmin_unit_found = (SetupDiEnumDeviceInterfaces(hdevinfo,
-                                                           NULL,(GUID *) &GARMIN_GUID, 0, &infodata) != 0);
+                                                           NULL,(GUID *) &GARMIN_GUID1, 0, &infodata) != 0);
     
     if(!bgarmin_unit_found)
         return INVALID_HANDLE_VALUE;
@@ -2158,7 +1382,7 @@ int GarminProtocolHandler::gusb_cmd_send(const garmin_usb_packet *opkt, size_t s
 
 int GarminProtocolHandler::gusb_cmd_get(garmin_usb_packet *ibuf, size_t sz)
 {
-    int rv;
+    int rv = 0;
     unsigned char *buf = (unsigned char *) &ibuf->dbuf[0];
     int orig_receive_state;
     top:
@@ -2340,6 +1564,7 @@ void *GARMIN_Serial_Thread::Entry()
     m_bconnected = false;
     
     bool not_done = true;
+    wxDateTime last_rx_time;
  
    
 #ifdef USE_GARMINHOST
@@ -2357,10 +1582,13 @@ void *GARMIN_Serial_Thread::Entry()
             //  Try to init the port once
             int v_init = Garmin_GPS_Init(m_port);
             if( v_init < 0 ){           //  Open failed, so sleep and try again
-                wxSleep(4);
-                
-                if(TestDestroy())
-                    goto thread_exit;
+                for( int i=0 ; i < 4 ; i++) {
+                    wxSleep(1);
+                    if(TestDestroy())
+                        goto thread_exit;
+                    if( !m_parent->m_Thread_run_flag )
+                        goto thread_exit;
+                }
             }
             else
                 m_bdetected = true;
@@ -2417,16 +1645,30 @@ void *GARMIN_Serial_Thread::Entry()
 
                         if( m_pMessageTarget ) {
                             OCPN_DataStreamEvent Nevent(wxEVT_OCPN_DATASTREAM, 0);
-                            std::string s = std::string(message.mb_str());
-                            Nevent.SetNMEAString(s);
-                            Nevent.SetStreamName(std::string( m_parent_stream->GetPort().mb_str() ));
-                            Nevent.SetPriority(m_parent_stream->GetPriority());
-                        
-                            m_pMessageTarget->AddPendingEvent(Nevent);
+                            wxCharBuffer buffer=message.ToUTF8();
+                            if(buffer.data()) {
+                                Nevent.SetNMEAString( buffer.data() );
+                                Nevent.SetStream( m_parent_stream );
+                                
+                                m_pMessageTarget->AddPendingEvent(Nevent);
+                            }
                         }
                         
+                        last_rx_time = wxDateTime::Now();
+                        
                     }
-            }
+                }
+                else {
+                    wxDateTime now = wxDateTime::Now();
+                    if( last_rx_time.IsValid() ) {
+                        wxTimeSpan delta_time = now - last_rx_time;
+                        if( delta_time.GetSeconds() > 5 ) {
+                            m_bdetected = false;
+                            m_bconnected = false;
+                            Garmin_GPS_ClosePortVerify();
+                        }
+                    }
+                }
         }
     }                          // the big while...
             
@@ -2527,12 +1769,13 @@ void *GARMIN_USB_Thread::Entry()
 
                   if( m_pMessageTarget ) {
                     OCPN_DataStreamEvent Nevent(wxEVT_OCPN_DATASTREAM, 0);
-                    std::string s = std::string(message.mb_str());
-                    Nevent.SetNMEAString(s);
-                    Nevent.SetStreamName(std::string( m_parent_stream->GetPort().mb_str() ));
-                    Nevent.SetPriority(m_parent_stream->GetPriority());
-                  
-                    m_pMessageTarget->AddPendingEvent(Nevent);
+                    wxCharBuffer buffer=message.ToUTF8();
+                    if(buffer.data()) {
+                        Nevent.SetNMEAString( buffer.data() );
+                        Nevent.SetStream( m_parent_stream );
+                        
+                        m_pMessageTarget->AddPendingEvent(Nevent);
+                    }
                   }
                   
             }
@@ -2577,15 +1820,16 @@ void *GARMIN_USB_Thread::Entry()
 
                           if( m_pMessageTarget ) {
                             OCPN_DataStreamEvent Nevent(wxEVT_OCPN_DATASTREAM, 0);
-                            std::string s = std::string(message.mb_str());
-                            Nevent.SetNMEAString(s);
-                            Nevent.SetStreamName(std::string( m_parent_stream->GetPort().mb_str() ));
-                            Nevent.SetPriority(m_parent_stream->GetPriority());
-                          
-                            m_pMessageTarget->AddPendingEvent(Nevent);
+                            wxCharBuffer buffer=message.ToUTF8();
+                            if(buffer.data()) {
+                                Nevent.SetNMEAString( buffer.data() );
+                                Nevent.SetStream( m_parent_stream );
+                                
+                                m_pMessageTarget->AddPendingEvent(Nevent);
+                            }
                           }
                           
-                          }
+                   }
                   
             }
 
@@ -2679,4 +1923,23 @@ int GARMIN_USB_Thread::gusb_win_get_bulk(garmin_usb_packet *ibuf, size_t sz)
 }
         
         
+bool DataStream::SetOutputSocketOptions(wxSocketBase* tsock)
+{
+    int ret;
 
+    // Disable nagle algorithm on outgoing connection
+    // Doing this here rather than after the accept() is
+    // pointless  on platforms where TCP_NODELAY is
+    // not inherited.  However, none of OpenCPN's currently
+    // supported platforms fall into that category.
+
+    int nagleDisable=1;
+    ret = tsock->SetOption(IPPROTO_TCP,TCP_NODELAY,&nagleDisable, sizeof(nagleDisable));
+                        
+    //  Drastically reduce the size of the socket output buffer
+    //  so that when client goes away without properly closing, the stream will
+    //  quickly fill the output buffer, and thus fail the write() call
+    //  within a few seconds.    
+    unsigned long outbuf_size = 1024;       // Smallest allowable value on Linux
+    return (tsock->SetOption(SOL_SOCKET,SO_SNDBUF,&outbuf_size, sizeof(outbuf_size)) && ret);
+}
